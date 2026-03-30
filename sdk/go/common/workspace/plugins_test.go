@@ -964,6 +964,156 @@ func TestPluginGetLatestVersion(t *testing.T) {
 	})
 }
 
+// TestGithubSourceProxyHosts verifies that PULUMI_GITHUB_API_HOST and
+// PULUMI_GITHUB_DOWNLOAD_HOST redirect all GitHub traffic through a proxy while keeping paths
+// identical — the canonical pattern for Artifactory generic remote repositories.
+//
+//nolint:paralleltest // mutates environment variables
+func TestGithubSourceProxyHosts(t *testing.T) {
+	const (
+		apiProxy = "github-api.myproxy.test"
+		dlProxy  = "github-com.myproxy.test"
+	)
+	expectedBytes := []byte{1, 2, 3}
+	version := semver.MustParse("1.2.3")
+
+	t.Run("PULUMI_GITHUB_API_HOST redirects GetLatestVersion", func(t *testing.T) {
+		t.Setenv("PULUMI_GITHUB_API_HOST", apiProxy)
+		t.Setenv("PULUMI_GITHUB_DOWNLOAD_HOST", "")
+		t.Setenv("GITHUB_TOKEN", "")
+
+		spec := PluginDescriptor{Name: "mockdl", Kind: apitype.ResourcePlugin}
+		source, err := spec.GetSource()
+		require.NoError(t, err)
+
+		getHTTPResponse := func(req *http.Request) (io.ReadCloser, int64, error) {
+			assert.Equal(t,
+				"https://"+apiProxy+"/repos/pulumi/pulumi-mockdl/releases/latest",
+				req.URL.String())
+			return newMockReadCloserString(`{"tag_name": "v1.2.3"}`)
+		}
+		got, err := source.GetLatestVersion(t.Context(), getHTTPResponse)
+		require.NoError(t, err)
+		assert.Equal(t, version, *got)
+	})
+
+	t.Run("PULUMI_GITHUB_DOWNLOAD_HOST redirects direct download", func(t *testing.T) {
+		t.Setenv("PULUMI_GITHUB_API_HOST", "")
+		t.Setenv("PULUMI_GITHUB_DOWNLOAD_HOST", dlProxy)
+		t.Setenv("GITHUB_TOKEN", "")
+
+		spec := PluginDescriptor{
+			Name:    "mockdl",
+			Kind:    apitype.ResourcePlugin,
+			Version: &version,
+		}
+		source, err := spec.GetSource()
+		require.NoError(t, err)
+
+		getHTTPResponse := func(req *http.Request) (io.ReadCloser, int64, error) {
+			assert.Equal(t,
+				"https://"+dlProxy+"/pulumi/pulumi-mockdl/releases/download/v1.2.3/"+
+					"pulumi-resource-mockdl-v1.2.3-linux-amd64.tar.gz",
+				req.URL.String())
+			return newMockReadCloser(expectedBytes)
+		}
+		r, l, err := source.Download(t.Context(), version, "linux", "amd64", getHTTPResponse)
+		require.NoError(t, err)
+		readBytes, err := io.ReadAll(r)
+		require.NoError(t, err)
+		assert.Equal(t, int(l), len(readBytes))
+		assert.Equal(t, expectedBytes, readBytes)
+	})
+
+	t.Run("both proxies redirect full download via API fallback", func(t *testing.T) {
+		// Simulate the case where direct download returns 404 so we fall back to the API.
+		// Both the release metadata request and the subsequent asset download must go through
+		// the respective proxies.
+		t.Setenv("PULUMI_GITHUB_API_HOST", apiProxy)
+		t.Setenv("PULUMI_GITHUB_DOWNLOAD_HOST", dlProxy)
+		t.Setenv("GITHUB_TOKEN", "")
+
+		spec := PluginDescriptor{
+			Name:    "mockdl",
+			Kind:    apitype.ResourcePlugin,
+			Version: &version,
+		}
+		source, err := spec.GetSource()
+		require.NoError(t, err)
+
+		assetName := "pulumi-resource-mockdl-v1.2.3-linux-amd64.tar.gz"
+		// asset.URL as returned by the GitHub API always references api.github.com.
+		apiAssetURL := "https://api.github.com/repos/pulumi/pulumi-mockdl/releases/assets/99"
+
+		var requestURLs []string
+		getHTTPResponse := func(req *http.Request) (io.ReadCloser, int64, error) {
+			requestURLs = append(requestURLs, req.URL.String())
+			switch req.URL.String() {
+			case "https://" + dlProxy + "/pulumi/pulumi-mockdl/releases/download/v1.2.3/" + assetName:
+				// Direct download attempt — return 404 to trigger API fallback.
+				return nil, -1, errors.New("404 not found")
+			case "https://" + apiProxy + "/repos/pulumi/pulumi-mockdl/releases/tags/v1.2.3":
+				// Release metadata request — return JSON with asset URL as GitHub would.
+				return newMockReadCloserString(`{"assets":[{"name":"` + assetName + `","url":"` + apiAssetURL + `"}]}`)
+			case "https://" + apiProxy + "/repos/pulumi/pulumi-mockdl/releases/assets/99":
+				// Asset download after host rewrite.
+				return newMockReadCloser(expectedBytes)
+			default:
+				t.Errorf("unexpected request to %s", req.URL)
+				return nil, -1, errors.New("unexpected request")
+			}
+		}
+		r, l, err := source.Download(t.Context(), version, "linux", "amd64", getHTTPResponse)
+		require.NoError(t, err)
+		readBytes, err := io.ReadAll(r)
+		require.NoError(t, err)
+		assert.Equal(t, int(l), len(readBytes))
+		assert.Equal(t, expectedBytes, readBytes)
+
+		// Verify the three expected requests happened in order.
+		require.Len(t, requestURLs, 3)
+		assert.Equal(t, "https://"+dlProxy+"/pulumi/pulumi-mockdl/releases/download/v1.2.3/"+assetName, requestURLs[0])
+		assert.Equal(t, "https://"+apiProxy+"/repos/pulumi/pulumi-mockdl/releases/tags/v1.2.3", requestURLs[1])
+		assert.Equal(t, "https://"+apiProxy+"/repos/pulumi/pulumi-mockdl/releases/assets/99", requestURLs[2])
+	})
+
+	t.Run("URL() always returns canonical api.github.com host regardless of proxy", func(t *testing.T) {
+		t.Setenv("PULUMI_GITHUB_API_HOST", apiProxy)
+		t.Setenv("PULUMI_GITHUB_DOWNLOAD_HOST", dlProxy)
+
+		spec := PluginDescriptor{Name: "mockdl", Kind: apitype.ResourcePlugin}
+		source, err := spec.GetSource()
+		require.NoError(t, err)
+		assert.Equal(t, "github://api.github.com/pulumi/pulumi-mockdl", source.URL())
+	})
+
+	t.Run("proxy env vars do not affect custom GitHub Enterprise sources", func(t *testing.T) {
+		// A custom PluginDownloadURL pointing at a GitHub Enterprise instance must never have
+		// its host silently replaced by the public-GitHub proxy variables.
+		t.Setenv("PULUMI_GITHUB_API_HOST", apiProxy)
+		t.Setenv("PULUMI_GITHUB_DOWNLOAD_HOST", dlProxy)
+		t.Setenv("GITHUB_TOKEN", "")
+
+		spec := PluginDescriptor{
+			Name:              "mockdl",
+			Kind:              apitype.ResourcePlugin,
+			PluginDownloadURL: "github://github.myenterprise.example.com/myorg",
+		}
+		source, err := spec.GetSource()
+		require.NoError(t, err)
+
+		getHTTPResponse := func(req *http.Request) (io.ReadCloser, int64, error) {
+			// Must target the enterprise host, not either proxy.
+			assert.Contains(t, req.URL.Host, "myenterprise.example.com")
+			assert.NotContains(t, req.URL.Host, apiProxy)
+			assert.NotContains(t, req.URL.Host, dlProxy)
+			return newMockReadCloserString(`{"tag_name": "v1.2.3"}`)
+		}
+		_, err = source.GetLatestVersion(t.Context(), getHTTPResponse)
+		require.NoError(t, err)
+	})
+}
+
 func TestParsePluginDownloadURLOverride(t *testing.T) {
 	t.Parallel()
 

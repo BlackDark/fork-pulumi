@@ -156,6 +156,28 @@ var RunProgram = env.Bool("RUN_PROGRAM",
 // will capture any GitHub-hosted plugin and redirect to its corresponding folder under https://foo.com/downloads
 var PluginDownloadURLOverrides = env.String("PLUGIN_DOWNLOAD_URL_OVERRIDES", "")
 
+// GitHubAPIHost overrides the hostname used when calling the GitHub API (api.github.com) for
+// plugin version lookups and release asset discovery. Only applies to sources that target
+// api.github.com; custom GitHub Enterprise sources are unaffected.
+//
+// Useful for routing through a generic Artifactory (or similar) reverse proxy, e.g.
+//
+//	PULUMI_GITHUB_API_HOST=github-api.myproxy.example.com
+var GitHubAPIHost = env.String("GITHUB_API_HOST",
+	"Override the GitHub API hostname (api.github.com) used for plugin downloads. "+
+		"Set to a reverse-proxy host such as an Artifactory generic remote that fronts api.github.com.")
+
+// GitHubDownloadHost overrides the hostname used when downloading plugin release archives
+// directly from github.com (the non-API download path). Only applies to sources that target
+// api.github.com (i.e. the public GitHub); custom GitHub Enterprise sources are unaffected.
+//
+// Useful for routing through a generic Artifactory (or similar) reverse proxy, e.g.
+//
+//	PULUMI_GITHUB_DOWNLOAD_HOST=github-com.myproxy.example.com
+var GitHubDownloadHost = env.String("GITHUB_DOWNLOAD_HOST",
+	"Override the GitHub download hostname (github.com) used for plugin release archives. "+
+		"Set to a reverse-proxy host such as an Artifactory generic remote that fronts github.com.")
+
 // By default `pulumi preview --json` emits a "PreviewDigest" JSON object to stdout. Setting this envvar changes
 // the behavior of `pulumi preview --json` to match the behavior of `pulumi up|destroy|refresh --json`, that is,
 // to stream JSON events to stdout.

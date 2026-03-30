@@ -457,10 +457,17 @@ func (source *gitSource) URL() string {
 // githubSource can download a plugin from github releases
 type githubSource struct {
 	host         string
+	downloadHost string // host for direct release downloads (defaults to "github.com")
 	organization string
 	repository   string
 	name         string
 	kind         apitype.PluginKind
+
+	// isPublicGitHub is true when the source was originally created targeting api.github.com.
+	// It gates the direct-download optimisation and host-proxy substitutions so that custom
+	// GitHub Enterprise sources are never affected by PULUMI_GITHUB_API_HOST /
+	// PULUMI_GITHUB_DOWNLOAD_HOST.
+	isPublicGitHub bool
 
 	token string
 
@@ -526,12 +533,28 @@ func newGithubSource(url *url.URL, name string, kind apitype.PluginKind) (*githu
 		repository = parts[1]
 	}
 
+	// Apply proxy host overrides only when targeting public GitHub (api.github.com).
+	// Custom GitHub Enterprise sources keep their original hosts unchanged.
+	isPublicGitHub := host == "api.github.com"
+	apiHost := host
+	downloadHost := "github.com"
+	if isPublicGitHub {
+		if override := env.GitHubAPIHost.Value(); override != "" {
+			apiHost = override
+		}
+		if override := env.GitHubDownloadHost.Value(); override != "" {
+			downloadHost = override
+		}
+	}
+
 	return &githubSource{
-		host:         host,
-		organization: organization,
-		repository:   repository,
-		name:         name,
-		kind:         kind,
+		host:           apiHost,
+		downloadHost:   downloadHost,
+		isPublicGitHub: isPublicGitHub,
+		organization:   organization,
+		repository:     repository,
+		name:           name,
+		kind:           kind,
 
 		token: os.Getenv("GITHUB_TOKEN"),
 	}, nil
@@ -649,10 +672,13 @@ func (source *githubSource) Download(
 	// the API. This costs us one additional request, but it doesn't count at the rate limit,
 	// and compared to the time it takes to download the plugin the additional time for the
 	// API request should be negligible.
-	if source.organization == "pulumi" && source.host == "api.github.com" {
+	//
+	// When PULUMI_GITHUB_DOWNLOAD_HOST is set, source.downloadHost is the proxy host and
+	// source.isPublicGitHub remains true, so the optimisation still fires through the proxy.
+	if source.organization == "pulumi" && source.isPublicGitHub {
 		directURL := fmt.Sprintf(
-			"https://github.com/%s/%s/releases/download/v%s/%s",
-			source.organization, source.repository, version, assetName)
+			"https://%s/%s/%s/releases/download/v%s/%s",
+			source.downloadHost, source.organization, source.repository, version, assetName)
 		logging.V(1).Infof("%s trying direct download from %s", source.name, directURL)
 
 		req, err := buildHTTPRequest(ctx, directURL, "")
@@ -708,12 +734,26 @@ func (source *githubSource) downloadViaAPI(
 		return nil, -1, fmt.Errorf("plugin asset '%s' not found", assetName)
 	}
 
+	// The asset URL returned by the GitHub API always references api.github.com.  When
+	// PULUMI_GITHUB_API_HOST is set, source.host is the proxy host, so we rewrite the URL so
+	// that the subsequent download request also goes through the proxy rather than directly to
+	// api.github.com.
+	if source.isPublicGitHub && source.host != "api.github.com" {
+		assetURL = strings.Replace(assetURL, "https://api.github.com/", "https://"+source.host+"/", 1)
+	}
+
 	logging.V(1).Infof("%s downloading from %s", source.name, assetURL)
 	return source.getHTTPResponse(ctx, getHTTPResponse, assetURL, "application/octet-stream")
 }
 
 func (source *githubSource) URL() string {
-	return fmt.Sprintf("github://%s/%s/%s", source.host, source.organization, source.repository)
+	// Report the canonical host (api.github.com for public GitHub) rather than the proxy host
+	// so that URL-based override matching and logging are unaffected by proxy configuration.
+	host := source.host
+	if source.isPublicGitHub {
+		host = "api.github.com"
+	}
+	return fmt.Sprintf("github://%s/%s/%s", host, source.organization, source.repository)
 }
 
 // httpSource can download a plugin from a given http url, it doesn't support GetLatestVersion
