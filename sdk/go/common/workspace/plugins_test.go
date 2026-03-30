@@ -979,7 +979,7 @@ func TestGithubSourceProxyHosts(t *testing.T) {
 
 	t.Run("PULUMI_GITHUB_API_HOST redirects GetLatestVersion", func(t *testing.T) {
 		t.Setenv("PULUMI_GITHUB_API_HOST", apiProxy)
-		t.Setenv("PULUMI_GITHUB_DOWNLOAD_HOST", "")
+		t.Setenv("PULUMI_GITHUB_DOWNLOAD_HOST", "") // empty string is treated as unset by the Value() guard
 		t.Setenv("GITHUB_TOKEN", "")
 
 		spec := PluginDescriptor{Name: "mockdl", Kind: apitype.ResourcePlugin}
@@ -998,7 +998,7 @@ func TestGithubSourceProxyHosts(t *testing.T) {
 	})
 
 	t.Run("PULUMI_GITHUB_DOWNLOAD_HOST redirects direct download", func(t *testing.T) {
-		t.Setenv("PULUMI_GITHUB_API_HOST", "")
+		t.Setenv("PULUMI_GITHUB_API_HOST", "") // empty string is treated as unset by the Value() guard
 		t.Setenv("PULUMI_GITHUB_DOWNLOAD_HOST", dlProxy)
 		t.Setenv("GITHUB_TOKEN", "")
 

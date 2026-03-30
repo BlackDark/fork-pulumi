@@ -1,0 +1,8 @@
+changes:
+- type: feat
+  scope: sdk/go
+  description: >
+    Add `PULUMI_GITHUB_API_HOST` and `PULUMI_GITHUB_DOWNLOAD_HOST` environment variables to
+    route plugin downloads through a reverse proxy (e.g. Artifactory generic remote) that
+    fronts api.github.com and github.com respectively. All URL paths are preserved so a
+    transparent proxy works without additional configuration.
