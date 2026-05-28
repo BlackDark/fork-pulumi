@@ -455,12 +455,32 @@ func (source *gitSource) URL() string {
 }
 
 // githubSource can download a plugin from github releases
+// githubSource can download a plugin from github releases.
+//
+// The proxy-related host fields (apiHost, downloadHost) are fixed at construction time by
+// reading PULUMI_GITHUB_API_HOST / PULUMI_GITHUB_DOWNLOAD_HOST once in newGithubSource.
+// They do not change after construction even if the environment variables are modified later.
 type githubSource struct {
-	host         string
+	// canonicalHost is the host from the original github:// URL (e.g. "api.github.com").
+	// It is used for URL identity reporting and override matching and is never changed by
+	// proxy configuration.
+	canonicalHost string
+	// apiHost is the effective hostname for GitHub API requests.  Equal to canonicalHost
+	// unless PULUMI_GITHUB_API_HOST redirects public-GitHub traffic through a proxy.
+	apiHost string
+	// downloadHost is the effective hostname for direct release-archive downloads.
+	// Defaults to "github.com"; overridden by PULUMI_GITHUB_DOWNLOAD_HOST.
+	downloadHost string
 	organization string
 	repository   string
 	name         string
 	kind         apitype.PluginKind
+
+	// isPublicGitHub is true when the source was originally created targeting api.github.com.
+	// It gates the direct-download optimisation and host-proxy substitutions so that custom
+	// GitHub Enterprise sources are never affected by PULUMI_GITHUB_API_HOST /
+	// PULUMI_GITHUB_DOWNLOAD_HOST.
+	isPublicGitHub bool
 
 	token string
 
@@ -526,12 +546,29 @@ func newGithubSource(url *url.URL, name string, kind apitype.PluginKind) (*githu
 		repository = parts[1]
 	}
 
+	// Apply proxy host overrides only when targeting public GitHub (api.github.com).
+	// Custom GitHub Enterprise sources keep their original hosts unchanged.
+	isPublicGitHub := host == "api.github.com"
+	apiHost := host
+	downloadHost := "github.com"
+	if isPublicGitHub {
+		if override := env.GitHubAPIHost.Value(); override != "" {
+			apiHost = override
+		}
+		if override := env.GitHubDownloadHost.Value(); override != "" {
+			downloadHost = override
+		}
+	}
+
 	return &githubSource{
-		host:         host,
-		organization: organization,
-		repository:   repository,
-		name:         name,
-		kind:         kind,
+		canonicalHost:  host,
+		apiHost:        apiHost,
+		downloadHost:   downloadHost,
+		isPublicGitHub: isPublicGitHub,
+		organization:   organization,
+		repository:     repository,
+		name:           name,
+		kind:           kind,
 
 		token: os.Getenv("GITHUB_TOKEN"),
 	}, nil
@@ -614,7 +651,7 @@ func (source *githubSource) GetLatestVersion(
 ) (*semver.Version, error) {
 	releaseURL := fmt.Sprintf(
 		"https://%s/repos/%s/%s/releases/latest",
-		source.host, source.organization, source.repository)
+		source.apiHost, source.organization, source.repository)
 	logging.V(9).Infof("plugin GitHub releases url: %s", releaseURL)
 	resp, length, err := source.getHTTPResponse(ctx, getHTTPResponse, releaseURL, "application/json")
 	if err != nil {
@@ -649,10 +686,13 @@ func (source *githubSource) Download(
 	// the API. This costs us one additional request, but it doesn't count at the rate limit,
 	// and compared to the time it takes to download the plugin the additional time for the
 	// API request should be negligible.
-	if source.organization == "pulumi" && source.host == "api.github.com" {
+	//
+	// When PULUMI_GITHUB_DOWNLOAD_HOST is set, source.downloadHost is the proxy host and
+	// source.isPublicGitHub remains true, so the optimisation still fires through the proxy.
+	if source.organization == "pulumi" && source.isPublicGitHub {
 		directURL := fmt.Sprintf(
-			"https://github.com/%s/%s/releases/download/v%s/%s",
-			source.organization, source.repository, version, assetName)
+			"https://%s/%s/%s/releases/download/v%s/%s",
+			source.downloadHost, source.organization, source.repository, version, assetName)
 		logging.V(1).Infof("%s trying direct download from %s", source.name, directURL)
 
 		req, err := buildHTTPRequest(ctx, directURL, "")
@@ -678,7 +718,7 @@ func (source *githubSource) downloadViaAPI(
 ) (io.ReadCloser, int64, error) {
 	releaseURL := fmt.Sprintf(
 		"https://%s/repos/%s/%s/releases/tags/v%s",
-		source.host, source.organization, source.repository, version)
+		source.apiHost, source.organization, source.repository, version)
 	logging.V(9).Infof("plugin GitHub releases url: %s", releaseURL)
 	resp, length, err := source.getHTTPResponse(ctx, getHTTPResponse, releaseURL, "application/json")
 	if err != nil {
@@ -708,12 +748,24 @@ func (source *githubSource) downloadViaAPI(
 		return nil, -1, fmt.Errorf("plugin asset '%s' not found", assetName)
 	}
 
+	// The asset URL returned by the GitHub API always references the canonical host
+	// (api.github.com for public GitHub).  When PULUMI_GITHUB_API_HOST redirects traffic
+	// through a proxy, rewrite the asset URL so the download also goes through the proxy.
+	if source.isPublicGitHub && source.apiHost != source.canonicalHost {
+		assetURL = strings.Replace(
+			assetURL,
+			"https://"+source.canonicalHost+"/",
+			"https://"+source.apiHost+"/",
+			1,
+		)
+	}
+
 	logging.V(1).Infof("%s downloading from %s", source.name, assetURL)
 	return source.getHTTPResponse(ctx, getHTTPResponse, assetURL, "application/octet-stream")
 }
 
 func (source *githubSource) URL() string {
-	return fmt.Sprintf("github://%s/%s/%s", source.host, source.organization, source.repository)
+	return fmt.Sprintf("github://%s/%s/%s", source.canonicalHost, source.organization, source.repository)
 }
 
 // httpSource can download a plugin from a given http url, it doesn't support GetLatestVersion
