@@ -16,6 +16,7 @@ package test
 
 import (
 	"encoding/json"
+	"maps"
 	"os"
 	"path/filepath"
 	"testing"
@@ -24,6 +25,7 @@ import (
 
 	"github.com/pulumi/pulumi/pkg/v3/codegen"
 	"github.com/pulumi/pulumi/pkg/v3/testing/integration"
+	ptesting "github.com/pulumi/pulumi/sdk/v3/go/common/testing"
 )
 
 func GenerateNodeJSBatchTest(t *testing.T, rootDir string, genProgram GenProgram, testCases []ProgramTest) {
@@ -67,7 +69,7 @@ func checkNodeJS(t *testing.T, path string, dependencies codegen.StringSet, link
 	}
 
 	// We delete and regenerate package files for each run.
-	removeFile("yarn.lock")
+	removeFile("package-lock.json")
 	removeFile("package.json")
 	removeFile("tsconfig.json")
 
@@ -82,9 +84,7 @@ func checkNodeJS(t *testing.T, path string, dependencies codegen.StringSet, link
 			"typescript":  "^4.5.5",
 		},
 	}
-	for pkg, v := range pkgs {
-		pkgInfo.Dependencies[pkg] = v
-	}
+	maps.Copy(pkgInfo.Dependencies, pkgs)
 	pkgJSON, err := json.MarshalIndent(pkgInfo, "", "    ")
 	require.NoError(t, err)
 	err = os.WriteFile(filepath.Join(dir, "package.json"), pkgJSON, 0o600)
@@ -106,10 +106,20 @@ func typeCheckNodeJS(t *testing.T, path string, _ codegen.StringSet, linkLocal b
 }
 
 func TypeCheckNodeJSPackage(t *testing.T, pwd string, linkLocal bool) {
-	RunCommandWithRetries(t, "npm_install", pwd, 3, "npm", "install")
 	if linkLocal {
-		RunCommand(t, "yarn_link", pwd, "yarn", "link", "@pulumi/pulumi")
+		pkgPath := filepath.Join(pwd, "package.json")
+		original, err := os.ReadFile(pkgPath)
+		existed := err == nil
+		t.Cleanup(func() {
+			if existed {
+				require.NoError(t, os.WriteFile(pkgPath, original, 0o600))
+			} else {
+				require.NoError(t, os.RemoveAll(pkgPath))
+			}
+		})
+		ptesting.ConfigureNodejsCoreSDK(t, pwd)
 	}
+	RunCommandWithRetries(t, "npm_install", pwd, 3, "npm", "install")
 	tscOptions := &integration.ProgramTestOptions{
 		// Avoid Out of Memory error on CI:
 		Env: []string{"NODE_OPTIONS=--max_old_space_size=4096"},
@@ -127,22 +137,8 @@ func nodejsPackages(t *testing.T, deps codegen.StringSet) map[string]string {
 			result[pkgName] = "^" + pkgVersion
 		}
 		switch d {
-		case "aws":
-			set(AwsSchema)
-		case "azure-native":
-			set(AzureNativeSchema)
-		case "azure":
-			set(AzureSchema)
-		case "kubernetes":
-			set(KubernetesSchema)
 		case "random":
 			set(RandomSchema)
-		case "eks":
-			set(EksSchema)
-		case "aws-static-website":
-			set(AwsStaticWebsiteSchema)
-		case "aws-native":
-			set(AwsNativeSchema)
 		default:
 			t.Logf("Unknown package requested: %s", d)
 		}

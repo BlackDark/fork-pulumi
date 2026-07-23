@@ -30,6 +30,8 @@ import (
 	"testing"
 	"time"
 
+	pkgresource "github.com/pulumi/pulumi/pkg/v3/resource"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gocloud.dev/blob"
@@ -219,7 +221,7 @@ func TestGetLogsForTargetWithNoSnapshot(t *testing.T) {
 		Snapshot:  nil,
 	}
 	query := operations.LogQuery{}
-	res, err := GetLogsForTarget(target, query)
+	res, err := GetLogsForTarget(t.Context(), target, query)
 	require.NoError(t, err)
 	assert.Nil(t, res)
 }
@@ -239,7 +241,7 @@ func makeUntypedDeploymentTimestamp(
 		return nil, err
 	}
 
-	resources := []*resource.State{
+	resources := []*pkgresource.State{
 		{
 			URN:  resource.NewURN("a", "proj", "d:e:f", "a:b:c", name),
 			Type: "a:b:c",
@@ -251,7 +253,7 @@ func makeUntypedDeploymentTimestamp(
 		},
 	}
 
-	snap := deploy.NewSnapshot(deploy.Manifest{}, sm, resources, nil, deploy.SnapshotMetadata{})
+	snap := deploy.NewSnapshot(deploy.Manifest{}, sm, resources, nil, deploy.SnapshotMetadata{}, nil, nil)
 
 	udep, err := stack.SerializeUntypedDeployment(t.Context(), snap, nil /*opts*/)
 	if err != nil {
@@ -611,7 +613,7 @@ func TestRenamePreservesIntegrity(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, stk)
 
-	rBase := &resource.State{
+	rBase := &pkgresource.State{
 		URN:  resource.NewURN("a", "proj", "d:e:f", "a:b:c", "base"),
 		Type: "a:b:c",
 		Inputs: resource.PropertyMap{
@@ -619,7 +621,7 @@ func TestRenamePreservesIntegrity(t *testing.T) {
 		},
 	}
 
-	rDependency := &resource.State{
+	rDependency := &pkgresource.State{
 		URN:  resource.NewURN("a", "proj", "d:e:f", "a:b:c", "dependency"),
 		Type: "a:b:c",
 		Inputs: resource.PropertyMap{
@@ -628,7 +630,7 @@ func TestRenamePreservesIntegrity(t *testing.T) {
 		Dependencies: []resource.URN{rBase.URN},
 	}
 
-	rPropertyDependency := &resource.State{
+	rPropertyDependency := &pkgresource.State{
 		URN:  resource.NewURN("a", "proj", "d:e:f", "a:b:c", "property-dependency"),
 		Type: "a:b:c",
 		Inputs: resource.PropertyMap{
@@ -639,7 +641,7 @@ func TestRenamePreservesIntegrity(t *testing.T) {
 		},
 	}
 
-	rDeletedWith := &resource.State{
+	rDeletedWith := &pkgresource.State{
 		URN:  resource.NewURN("a", "proj", "d:e:f", "a:b:c", "deleted-with"),
 		Type: "a:b:c",
 		Inputs: resource.PropertyMap{
@@ -648,7 +650,7 @@ func TestRenamePreservesIntegrity(t *testing.T) {
 		DeletedWith: rBase.URN,
 	}
 
-	rParent := &resource.State{
+	rParent := &pkgresource.State{
 		URN:  resource.NewURN("a", "proj", "d:e:f", "a:b:c", "parent"),
 		Type: "a:b:c",
 		Inputs: resource.PropertyMap{
@@ -657,7 +659,7 @@ func TestRenamePreservesIntegrity(t *testing.T) {
 		Parent: rBase.URN,
 	}
 
-	resources := []*resource.State{
+	resources := []*pkgresource.State{
 		rBase,
 		rDependency,
 		rPropertyDependency,
@@ -665,7 +667,7 @@ func TestRenamePreservesIntegrity(t *testing.T) {
 		rParent,
 	}
 
-	snap := deploy.NewSnapshot(deploy.Manifest{}, nil, resources, nil, deploy.SnapshotMetadata{})
+	snap := deploy.NewSnapshot(deploy.Manifest{}, nil, resources, nil, deploy.SnapshotMetadata{}, nil, nil)
 	ctx = t.Context()
 
 	udep, err := stack.SerializeUntypedDeployment(ctx, snap, nil /*opts*/)
@@ -776,7 +778,7 @@ func TestHtmlEscaping(t *testing.T) {
 	t.Parallel()
 
 	sm := b64.NewBase64SecretsManager()
-	resources := []*resource.State{
+	resources := []*pkgresource.State{
 		{
 			URN:  resource.NewURN("a", "proj", "d:e:f", "a:b:c", "name"),
 			Type: "a:b:c",
@@ -786,7 +788,7 @@ func TestHtmlEscaping(t *testing.T) {
 		},
 	}
 
-	snap := deploy.NewSnapshot(deploy.Manifest{}, sm, resources, nil, deploy.SnapshotMetadata{})
+	snap := deploy.NewSnapshot(deploy.Manifest{}, sm, resources, nil, deploy.SnapshotMetadata{}, nil, nil)
 	ctx := t.Context()
 
 	udep, err := stack.SerializeUntypedDeployment(ctx, snap, &stack.SerializeOptions{
@@ -980,7 +982,7 @@ func TestStackReferenceString_currentProjectChange_race(t *testing.T) {
 
 	projects := make([]*workspace.Project, N)
 	refs := make([]backend.StackReference, N)
-	for i := 0; i < N; i++ {
+	for i := range N {
 		name := fmt.Sprintf("proj%d", i)
 		projects[i] = &workspace.Project{Name: tokens.PackageName(name)}
 		refs[i], err = b.ParseStackReference(fmt.Sprintf("organization/%v/foo", name))
@@ -996,23 +998,19 @@ func TestStackReferenceString_currentProjectChange_race(t *testing.T) {
 	var wg sync.WaitGroup
 	ready := make(chan struct{}) // both goroutines wait on this
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		<-ready
-		for i := 0; i < N; i++ {
+		for i := range N {
 			_ = refs[i].String()
 		}
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		<-ready
-		for i := 0; i < N; i++ {
+		for i := range N {
 			b.SetCurrentProject(projects[i])
 		}
-	}()
+	})
 
 	close(ready) // start racing
 	wg.Wait()
@@ -1519,7 +1517,7 @@ func TestUpgrade_manyFailures(t *testing.T) {
 	bucket, err := fileblob.OpenBucket(tmpDir, nil)
 	require.NoError(t, err)
 	ctx := t.Context()
-	for i := 0; i < numStacks; i++ {
+	for i := range numStacks {
 		stackPath := path.Join(".pulumi", "stacks", fmt.Sprintf("stack-%d.json", i))
 		require.NoError(t, bucket.WriteAll(ctx, stackPath, []byte(badStackBody), nil))
 	}
@@ -1533,7 +1531,7 @@ func TestUpgrade_manyFailures(t *testing.T) {
 
 	require.NoError(t, b.Upgrade(ctx, nil /* opts */))
 	out := output.String()
-	for i := 0; i < numStacks; i++ {
+	for i := range numStacks {
 		assert.Contains(t, out, fmt.Sprintf(`Skipping stack "stack-%d"`, i))
 	}
 }
@@ -1934,7 +1932,7 @@ func TestParallelStackFetch(t *testing.T) {
 	// Create multiple stacks to test parallel fetching
 	numStacks := 10
 	stackRefs := make([]backend.StackReference, numStacks)
-	for i := 0; i < numStacks; i++ {
+	for i := range numStacks {
 		stackName := fmt.Sprintf("stack%d", i)
 		stackRef, err := b.ParseStackReference(stackName)
 		require.NoError(t, err)
@@ -1958,7 +1956,7 @@ func TestParallelStackFetch(t *testing.T) {
 		stackNames[stack.Name().String()] = true
 	}
 
-	for i := 0; i < numStacks; i++ {
+	for i := range numStacks {
 		stackName := fmt.Sprintf("stack%d", i)
 		assert.True(t, stackNames[stackName], "Stack %s should be in the results", stackName)
 	}
@@ -1983,7 +1981,7 @@ func TestParallelStackFetchDefaultValue(t *testing.T) {
 	// Create multiple stacks to test parallel fetching with default value
 	numStacks := 5
 	stackRefs := make([]backend.StackReference, numStacks)
-	for i := 0; i < numStacks; i++ {
+	for i := range numStacks {
 		stackName := fmt.Sprintf("stack%d", i)
 		stackRef, err := b.ParseStackReference(stackName)
 		require.NoError(t, err)
@@ -2007,7 +2005,7 @@ func TestParallelStackFetchDefaultValue(t *testing.T) {
 		stackNames[stack.Name().String()] = true
 	}
 
-	for i := 0; i < numStacks; i++ {
+	for i := range numStacks {
 		stackName := fmt.Sprintf("stack%d", i)
 		assert.True(t, stackNames[stackName], "Stack %s should be in the results", stackName)
 	}
@@ -2031,7 +2029,7 @@ func TestListStackNames(t *testing.T) {
 	// Create test stacks
 	numStacks := 3
 	expectedStackNames := make([]string, numStacks)
-	for i := 0; i < numStacks; i++ {
+	for i := range numStacks {
 		stackName := fmt.Sprintf("stack%d", i)
 		expectedStackNames[i] = stackName
 		stackRef, err := b.ParseStackReference(stackName)

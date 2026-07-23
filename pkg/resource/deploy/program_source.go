@@ -15,12 +15,16 @@
 package deploy
 
 import (
+	"context"
 	"fmt"
 
+	"github.com/blang/semver"
+	"github.com/pulumi/pulumi/pkg/v3/codegen/convert"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/schema"
+	"github.com/pulumi/pulumi/pkg/v3/pluginstorage"
+	"github.com/pulumi/pulumi/pkg/v3/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/promise"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/result"
 )
@@ -61,8 +65,22 @@ func (src *programSource) run(resourceMonitorTarget string) *promise.Promise[str
 
 	// Also start up a schema loader for the language runtime to use to fetch schema information.
 	loaderRegistration := schema.LoaderRegistration(
-		schema.NewLoaderServer(schema.NewPluginLoader(src.plugctx.Host)))
-	loaderServer, err := plugin.NewServer(src.plugctx, loaderRegistration)
+		schema.NewLoaderServer(schema.NewPluginLoader(src.plugctx)))
+
+	baseMapper, err := convert.NewBasePluginMapper(
+		pluginstorage.Instance,
+		"terraform",
+		convert.ProviderFactoryFromHost(context.Background(), src.plugctx),
+		func(string) *semver.Version { return nil },
+		nil,
+	)
+	if err != nil {
+		return promise.Errorf[struct{}]("failed to create mapper: %w", err)
+	}
+	mapperRegistration := convert.MapperRegistration(
+		convert.NewMapperServer(convert.NewCachingMapper(baseMapper)))
+
+	loaderServer, err := plugin.NewServer(src.plugctx, loaderRegistration, mapperRegistration)
 	if err != nil {
 		return promise.Errorf[struct{}]("failed to start loader server: %w", err)
 	}
@@ -88,8 +106,11 @@ func (src *programSource) forkRun(
 			defer contract.IgnoreClose(loaderServer)
 
 			rt := src.runinfo.Proj.Runtime.Name()
+			if rt == "" {
+				return nil
+			}
 
-			langhost, err := src.plugctx.Host.LanguageRuntime(rt)
+			langhost, err := src.plugctx.Host.LanguageRuntime(src.plugctx, rt)
 			if err != nil {
 				return fmt.Errorf("failed to launch language host %s: %w", rt, err)
 			}

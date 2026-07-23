@@ -47,7 +47,8 @@ func newStateEditCommand() *cobra.Command {
 		Colorizer: cmdutil.GetGlobalColorization(),
 	}
 	cmd := &cobra.Command{
-		Use: "edit",
+		Use:     "edit",
+		Aliases: []string{"update", "modify"},
 		// TODO(dixler) Add test for unicode round-tripping before unhiding.
 		// TODO(fraser) This needs tests _in general_ it is currently basically untested.
 		Hidden: !env.Experimental.Value(),
@@ -75,6 +76,7 @@ a preview showing a diff of the altered state.`,
 					Color:         cmdutil.GetGlobalColorization(),
 					IsInteractive: true,
 				},
+				"",
 			)
 			if err != nil {
 				return err

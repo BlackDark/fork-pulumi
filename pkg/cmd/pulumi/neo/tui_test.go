@@ -16,6 +16,7 @@ package neo
 
 import (
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -24,7 +25,7 @@ import (
 	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
-	"github.com/acarl005/stripansi"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -60,6 +61,16 @@ func collectPrintln(cmd tea.Cmd) []string {
 		return out
 	}
 	v := reflect.ValueOf(msg)
+	// tea.Sequence yields an unexported sequenceMsg ([]Cmd); walk it like a batch.
+	if v.Kind() == reflect.Slice && v.Type().Name() == "sequenceMsg" {
+		var out []string
+		for i := 0; i < v.Len(); i++ {
+			if c, ok := v.Index(i).Interface().(tea.Cmd); ok {
+				out = append(out, collectPrintln(c)...)
+			}
+		}
+		return out
+	}
 	if v.Kind() == reflect.Struct && v.Type().Name() == "printLineMessage" {
 		if f := v.FieldByName("messageBody"); f.IsValid() && f.Kind() == reflect.String {
 			return []string{f.String()}
@@ -142,20 +153,22 @@ func TestTruncate(t *testing.T) {
 func TestRenderAssistantFinal(t *testing.T) {
 	t.Parallel()
 
+	m := &Model{hasDarkBackground: true}
+
 	// Empty (or whitespace-only) input collapses to empty — otherwise we'd emit
 	// a lone marker with no content, which looks broken.
-	assert.Empty(t, renderAssistantFinal(""))
-	assert.Empty(t, renderAssistantFinal("\n  "))
+	assert.Empty(t, m.renderAssistantFinal(""))
+	assert.Empty(t, m.renderAssistantFinal("\n  "))
 
 	// Single-line: the marker sits on the same line as the text. No indented
 	// continuation block.
-	singleLine := renderAssistantFinal("hello")
+	singleLine := m.renderAssistantFinal("hello")
 	assert.Contains(t, singleLine, "hello")
 	assert.NotContains(t, singleLine, "\n    ", "single-line output must not add a 4-space continuation indent")
 
 	// Multi-line: first line gets the marker; remaining lines are indented under
 	// the marker so the paragraph visually belongs to the assistant reply.
-	multi := renderAssistantFinal("first\nsecond\nthird")
+	multi := m.renderAssistantFinal("first\nsecond\nthird")
 	assert.Contains(t, multi, "first")
 	assert.Contains(t, multi, "second")
 	assert.Contains(t, multi, "third")
@@ -221,6 +234,36 @@ func TestNewModel_BusyStart(t *testing.T) {
 	assert.Equal(t, blockBusy, m.blocks[0].kind)
 	assert.Equal(t, shimmerVerb, m.blocks[0].shimmer)
 	assert.NotEmpty(t, m.blocks[0].label, "busy block must have a non-empty thinking label")
+}
+
+func TestNewModel_InitialViewDoesNotWrapPlaceholderToTinyWidth(t *testing.T) {
+	t.Parallel()
+
+	m := NewModel(ModelConfig{Busy: true, InitialWidth: 215})
+	view := ansi.Strip(m.viewString())
+
+	assert.Equal(t, 215, m.width)
+	assert.Equal(t, 211, m.liveWidth())
+	assert.Contains(t, view, "Send a message...",
+		"first frame before WindowSizeMsg must render the full placeholder")
+
+	m.textInput.SetWidth(2)
+	view = ansi.Strip(m.viewString())
+	assert.Contains(t, view, "Send a message...",
+		"empty input render must not trust a stale tiny textarea viewport")
+
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 4, Height: 79})
+	um := updated.(Model)
+	view = ansi.Strip(um.viewString())
+
+	assert.Equal(t, 215, um.width)
+	assert.Equal(t, 211, um.liveWidth())
+	assert.Contains(t, view, "Send a message...",
+		"bogus tiny startup WindowSizeMsg must not shrink the placeholder to Se")
+
+	updated, _ = um.Update(tea.WindowSizeMsg{Width: 120, Height: 79})
+	um = updated.(Model)
+	assert.Equal(t, 120, um.width, "subsequent valid resize must still be honored")
 }
 
 // -----------------------------------------------------------------------------
@@ -403,6 +446,20 @@ func TestModel_Update_KeyCtrlC_TwoPressesQuit(t *testing.T) {
 	assert.True(t, ok, "second consecutive Ctrl+C must produce a tea.QuitMsg")
 }
 
+func TestModel_Update_KeyCtrlC_WithDraftClearsInput(t *testing.T) {
+	t.Parallel()
+
+	m := NewModel(ModelConfig{})
+	m.textInput.SetValue("half typed")
+
+	updated, cmd := m.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})
+	um := updated.(Model)
+
+	assert.Empty(t, um.textInput.Value(), "Ctrl+C with a draft must clear the textarea")
+	assert.False(t, um.ctrlCArmed, "clearing a draft must not arm the exit prompt")
+	assert.Nil(t, cmd, "clearing a draft must not quit")
+}
+
 func TestModel_Update_KeyCtrlC_FirstPressCancelsWhenBusy(t *testing.T) {
 	t.Parallel()
 
@@ -458,6 +515,96 @@ func TestModel_Update_KeyCtrlC_OtherKeyDisarms(t *testing.T) {
 	}
 }
 
+func TestModel_Update_CtrlAWithDraftMovesCursorStart(t *testing.T) {
+	t.Parallel()
+
+	m := NewModel(ModelConfig{
+		InitialApprovalMode: client.NeoApprovalModeManual,
+	})
+	m.textInput.SetValue("hello")
+	m.textInput.MoveToEnd()
+	require.Equal(t, 5, m.textInput.Column(), "precondition: cursor starts at the end")
+
+	updated, _ := m.Update(tea.KeyPressMsg{Code: 'a', Mod: tea.ModCtrl})
+	um := updated.(Model)
+
+	assert.Equal(t, 0, um.textInput.Column(), "Ctrl+A with a draft must move to line start")
+	assert.Equal(t, client.NeoApprovalModeManual, um.approvalMode,
+		"Ctrl+A with a draft must not toggle approval mode")
+}
+
+func TestModel_Update_CtrlEWithDraftMovesCursorEnd(t *testing.T) {
+	t.Parallel()
+
+	m := NewModel(ModelConfig{})
+	m.textInput.SetValue("hello")
+	m.textInput.CursorStart()
+	require.Equal(t, 0, m.textInput.Column(), "precondition: cursor starts at the beginning")
+
+	updated, _ := m.Update(tea.KeyPressMsg{Code: 'e', Mod: tea.ModCtrl})
+	um := updated.(Model)
+
+	assert.Equal(t, 5, um.textInput.Column(), "Ctrl+E must move to line end")
+}
+
+func TestModel_Update_DraftEditingKeysUseTextareaKeymap(t *testing.T) {
+	t.Parallel()
+
+	t.Run("ctrl+d deletes forward instead of arming quit", func(t *testing.T) {
+		t.Parallel()
+
+		m := NewModel(ModelConfig{})
+		m.textInput.SetValue("abc")
+		m.textInput.CursorStart()
+
+		updated, cmd := m.Update(tea.KeyPressMsg{Code: 'd', Mod: tea.ModCtrl})
+		um := updated.(Model)
+
+		assert.Equal(t, "bc", um.textInput.Value())
+		assert.False(t, um.ctrlCArmed)
+		assert.Nil(t, cmd)
+	})
+
+	t.Run("meta+f moves forward one word", func(t *testing.T) {
+		t.Parallel()
+
+		m := NewModel(ModelConfig{})
+		m.textInput.SetValue("hello world")
+		m.textInput.CursorStart()
+
+		updated, _ := m.Update(tea.KeyPressMsg{Code: 'f', Mod: tea.ModMeta})
+		um := updated.(Model)
+
+		assert.Equal(t, 5, um.textInput.Column())
+	})
+
+	t.Run("meta+b moves backward one word", func(t *testing.T) {
+		t.Parallel()
+
+		m := NewModel(ModelConfig{})
+		m.textInput.SetValue("hello world")
+		m.textInput.MoveToEnd()
+
+		updated, _ := m.Update(tea.KeyPressMsg{Code: 'b', Mod: tea.ModMeta})
+		um := updated.(Model)
+
+		assert.Equal(t, 6, um.textInput.Column())
+	})
+
+	t.Run("cmd+backspace deletes backward one word", func(t *testing.T) {
+		t.Parallel()
+
+		m := NewModel(ModelConfig{})
+		m.textInput.SetValue("hello world")
+		m.textInput.MoveToEnd()
+
+		updated, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyBackspace, Mod: tea.ModSuper})
+		um := updated.(Model)
+
+		assert.Equal(t, "hello ", um.textInput.Value())
+	})
+}
+
 func TestModel_Update_KeyCtrlC_TimeoutDisarms(t *testing.T) {
 	t.Parallel()
 
@@ -495,12 +642,86 @@ func TestModel_Update_KeyCtrlC_StaleDisarmIgnored(t *testing.T) {
 
 	updated, _ = um.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})
 	um = updated.(Model)
+	require.False(t, um.ctrlCArmed, "Ctrl+C with a draft must clear before re-arming")
+	require.Empty(t, um.textInput.Value())
+
+	updated, _ = um.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})
+	um = updated.(Model)
 	require.True(t, um.ctrlCArmed)
 	require.Greater(t, um.ctrlCArmGen, staleGen, "re-arm must advance the generation")
 
 	updated, _ = um.Update(ctrlCDisarmMsg{gen: staleGen})
 	um = updated.(Model)
 	assert.True(t, um.ctrlCArmed, "stale-gen disarm tick must not clear a fresh arm")
+}
+
+func TestModel_Update_KeyCtrlZ_Suspends(t *testing.T) {
+	t.Parallel()
+
+	// Ctrl+Z must hand the shell back via standard job control (SIGTSTP).
+	// Bubbletea models this as the Suspend command, which resolves to a
+	// tea.SuspendMsg. It must work mid-turn, so assert it both idle and busy.
+	t.Run("idle", func(t *testing.T) {
+		t.Parallel()
+		m := NewModel(ModelConfig{})
+		_, cmd := m.Update(tea.KeyPressMsg{Code: 'z', Mod: tea.ModCtrl})
+		require.NotNil(t, cmd)
+		_, ok := cmd().(tea.SuspendMsg)
+		assert.True(t, ok, "Ctrl+Z must produce a tea.SuspendMsg")
+	})
+
+	t.Run("busy", func(t *testing.T) {
+		t.Parallel()
+		m := NewModel(ModelConfig{})
+		m.busy = true
+		_, cmd := m.Update(tea.KeyPressMsg{Code: 'z', Mod: tea.ModCtrl})
+		require.NotNil(t, cmd)
+		_, ok := cmd().(tea.SuspendMsg)
+		assert.True(t, ok, "Ctrl+Z must suspend even while the agent is busy")
+	})
+}
+
+func TestModel_CommittedScrollback(t *testing.T) {
+	t.Parallel()
+
+	// committedScrollback feeds both the initial flush and the resume reprint:
+	// the welcome banner first, then committed blocks in order, skipping live
+	// blocks (e.g. the busy spinner) and empty renders.
+	m := NewModel(ModelConfig{})
+	m.blocks = []block{
+		{kind: blockUserMessage, rendered: "user one"},
+		{kind: blockBusy, rendered: "spinner"}, // live — excluded
+		{kind: blockAssistantFinal, rendered: "assistant one"},
+		{kind: blockError, rendered: ""}, // empty — excluded
+	}
+
+	got := m.committedScrollback()
+	want := m.welcome.View() + "\n\nuser one\n\nassistant one"
+	assert.Equal(t, want, got,
+		"welcome leads, committed blocks follow in order, live and empty blocks dropped")
+}
+
+func TestModel_Update_Resume_ReprintsTranscript(t *testing.T) {
+	t.Parallel()
+
+	// On resume from a Ctrl+Z suspend, the committed transcript must be re-emitted
+	// to scrollback, since bubbletea only repaints the live frame. The first
+	// re-emitted block carries no leading blank line (hasEmittedScrollback reset),
+	// matching the initial flush.
+	m := NewModel(ModelConfig{})
+	m.hasEmittedScrollback = true // simulate a session that already printed
+	m.blocks = []block{
+		{kind: blockUserMessage, rendered: "user one"},
+		{kind: blockAssistantFinal, rendered: "assistant one"},
+	}
+
+	_, cmd := m.Update(tea.ResumeMsg{})
+	require.NotNil(t, cmd)
+
+	printed := collectPrintln(cmd)
+	want := []string{m.welcome.View() + "\n\nuser one\n\nassistant one"}
+	assert.Equal(t, want, printed,
+		"resume must reprint welcome + committed blocks as one atomic print, without a leading blank")
 }
 
 func TestModel_Update_KeyCtrlD_BehavesLikeCtrlC(t *testing.T) {
@@ -833,7 +1054,8 @@ func TestModel_Update_UIApprovalRequest_ShowsPromptAndPausesAgent(t *testing.T) 
 func TestModel_Update_KeyEnter_Approval_ApproveYes(t *testing.T) {
 	t.Parallel()
 
-	cases := []string{"y", "Y", "yes", "YES", "Yes"}
+	// Representative sample — exhaustive phrase coverage lives in TestIsAffirmative.
+	cases := []string{"y", "yes", "ok", "go ahead"}
 	for _, in := range cases {
 		t.Run(in, func(t *testing.T) {
 			t.Parallel()
@@ -872,8 +1094,9 @@ func TestModel_Update_KeyEnter_Approval_ApproveYes(t *testing.T) {
 func TestModel_Update_KeyEnter_Approval_DenyWithReason(t *testing.T) {
 	t.Parallel()
 
-	// Anything that isn't "y"/"yes" is treated as a denial; the typed text becomes
-	// the instructions field so the agent can act on the user's reasoning.
+	// Anything that isn't a recognized affirmative is treated as a denial; the
+	// typed text becomes the instructions field so the agent can act on the
+	// user's reasoning.
 	outCh := make(chan outboundEvent, 1)
 	m := newApprovalPendingModel(t, outCh)
 	m.textInput.SetValue("not on prod")
@@ -1141,6 +1364,16 @@ func TestModel_Update_UIToolCompleted_AppendsCompleteAndStaysBusy(t *testing.T) 
 	assert.Equal(t, blockToolComplete, um.blocks[len(um.blocks)-2].kind)
 }
 
+func TestToolCompletedBlockUsesStyledMarker(t *testing.T) {
+	t.Parallel()
+
+	okBlock := toolCompletedBlock("filesystem__read", nil, false)
+	errBlock := toolCompletedBlock("filesystem__read", nil, true)
+
+	assert.Contains(t, okBlock.rendered, toolOKMarker)
+	assert.Contains(t, errBlock.rendered, toolErrMarker)
+}
+
 func TestModel_Update_UIError_EndsBusyAndAppendsError(t *testing.T) {
 	t.Parallel()
 
@@ -1304,6 +1537,12 @@ func TestNewModel_InitialPromptRendersUserBlock(t *testing.T) {
 	// The busy block still sits at the bottom so the spinner is visible
 	// while the agent starts its first turn.
 	assert.Equal(t, blockBusy, m.blocks[len(m.blocks)-1].kind)
+
+	// Nothing has actually been printed yet, so the latch that adds a leading
+	// blank line before each subsequent print must still be unset — otherwise
+	// the welcome banner opens with a stray empty line.
+	assert.False(t, m.hasEmittedScrollback,
+		"seeding the initial prompt must not flip hasEmittedScrollback before anything is printed")
 }
 
 func TestModel_View_ShowsHintBasedOnBusy(t *testing.T) {
@@ -1954,47 +2193,47 @@ func TestWarningWrapsToTerminalWidth(t *testing.T) {
 	assert.Contains(t, got, "warning", "wrapped output must still contain the message body")
 }
 
-func TestUserBubbleWrapsToTerminalWidth(t *testing.T) {
+func TestUserMessageWrapsToTerminalWidth(t *testing.T) {
 	t.Parallel()
 
 	m := &Model{width: 40}
 	long := strings.Repeat("word ", 25) // ~125 chars
-	got := m.renderUserBubble(long)
+	got := m.renderUserMessage(long)
 
-	require.Contains(t, got, "\n", "long bubble must contain a newline (wrapped): %q", got)
+	require.Contains(t, got, "\n", "long user message must contain a newline (wrapped): %q", got)
 	for i, w := range visibleLines(got) {
-		assert.LessOrEqual(t, w, 40, "bubble line %d exceeds terminal width: width=%d", i, w)
+		assert.LessOrEqual(t, w, 40, "user message line %d exceeds terminal width: width=%d", i, w)
 	}
 }
 
-func TestUserBubbleDoesNotPadShortMessages(t *testing.T) {
+func TestUserMessageDoesNotPadShortMessages(t *testing.T) {
 	t.Parallel()
 
-	// Short messages hug content so the bubble looks like a chat bubble,
-	// not a full-width card.
+	// Short messages render on a single line that hugs the content — no
+	// trailing whitespace, no full-width card.
 	m := &Model{width: 80}
-	got := m.renderUserBubble("hi")
+	got := m.renderUserMessage("hi")
 
 	widths := visibleLines(got)
-	require.Len(t, widths, 1, "short bubble should render on a single line: %q", got)
-	assert.Less(t, widths[0], 20, "short bubble line should hug content, not fill terminal; got width=%d", widths[0])
+	require.Len(t, widths, 1, "short user message should render on a single line: %q", got)
+	assert.Less(t, widths[0], 20, "short user message line should hug content, not fill terminal; got width=%d", widths[0])
 }
 
-func TestUserBubbleWrapsAtWideTerminal(t *testing.T) {
+func TestUserMessageWrapsAtWideTerminal(t *testing.T) {
 	t.Parallel()
 
-	// At a wide terminal the bubble must wrap against liveWidth (m.width-4),
+	// At a wide terminal the message must wrap against liveWidth (m.width-4),
 	// not raw m.width — otherwise wrapped lines sit on the terminal wrap
 	// column and desync the inline-renderer line accounting.
 	const termWidth = 200
 	m := &Model{width: termWidth}
 	long := strings.Repeat("word ", 60) // ~300 chars, forces wrap
-	got := m.renderUserBubble(long)
+	got := m.renderUserMessage(long)
 
 	widths := visibleLines(got)
-	require.Greater(t, len(widths), 1, "long bubble at wide terminal must wrap; got: %q", got)
+	require.Greater(t, len(widths), 1, "long user message at wide terminal must wrap; got: %q", got)
 	for i, w := range widths {
-		assert.LessOrEqual(t, w, m.liveWidth(), "bubble line %d sits past liveWidth: width=%d", i, w)
+		assert.LessOrEqual(t, w, m.liveWidth(), "user message line %d sits past liveWidth: width=%d", i, w)
 	}
 }
 
@@ -2089,7 +2328,7 @@ func TestModel_LiveView_OnlyShowsLiveBlocks(t *testing.T) {
 	view := m.viewString()
 	// Live blocks are visible. Shimmer styles each char with its own ANSI
 	// run, so strip escapes before substring-matching the label.
-	assert.Contains(t, stripansi.Strip(view), "Thinking", "busy label must appear in View")
+	assert.Contains(t, ansi.Strip(view), "Thinking", "busy label must appear in View")
 	// Committed blocks are NOT visible — they were emitted to scrollback.
 	assert.NotContains(t, view, "USERSCROLLBACK")
 	assert.NotContains(t, view, "TOOLCOMPLETESCROLLBACK")
@@ -2271,6 +2510,32 @@ func TestModel_Update_FirstWindowSize_EmitsWelcomeAndInitialPromptToScrollback(t
 	}
 }
 
+func TestModel_Update_FirstFlush_EmitsWelcomeBeforeInitialPrompt(t *testing.T) {
+	t.Parallel()
+
+	// Update returns its cmds via tea.Batch, which runs them concurrently
+	// with no ordering guarantee — emitted as separate tea.Println cmds, the
+	// pre-seeded initial-prompt block would race the welcome banner and could
+	// land above it in scrollback. The flush must therefore be a single
+	// atomic Println with the banner ahead of the prompt inside it.
+	m := NewModel(ModelConfig{InitialPrompt: "deploy prod"})
+	updated, sizeCmd := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	um := updated.(Model)
+
+	_, cmd := um.Update(runFirstFlushTick(t, sizeCmd))
+	require.NotNil(t, cmd)
+
+	printed := collectPrintln(cmd)
+	require.Len(t, printed, 1, "flush must be a single atomic print; got: %v", printed)
+	banner := strings.Index(printed[0], "Pulumi Neo")
+	prompt := strings.Index(printed[0], "deploy prod")
+	require.NotEqual(t, -1, banner, "flush must contain the welcome banner")
+	require.NotEqual(t, -1, prompt, "flush must contain the initial-prompt block")
+	assert.Less(t, banner, prompt, "welcome banner must precede the initial-prompt block")
+	assert.False(t, strings.HasPrefix(printed[0], "\n"),
+		"the flush is the first thing printed and must not open with a blank line")
+}
+
 func TestModel_Update_UIPulumiEnd_CommitsRenderedToScrollback(t *testing.T) {
 	t.Parallel()
 
@@ -2370,6 +2635,96 @@ func TestPrintlnBlock_SubsequentEmissionsLeadByNewline(t *testing.T) {
 		"subsequent emissions must start with a single \\n so blocks have a blank-line gap")
 }
 
+func TestNewModel_StagesHistoryWithoutUsingEventChannel(t *testing.T) {
+	t.Parallel()
+
+	history := make([]UIEvent, 70)
+	for i := range history {
+		history[i] = UIUserMessage{Content: fmt.Sprintf("history-%02d", i)}
+	}
+	ch := make(chan UIEvent)
+
+	m := NewModel(ModelConfig{
+		EventCh: ch,
+		History: history,
+	})
+
+	var userBlocks int
+	for _, b := range m.blocks {
+		if b.kind == blockUserMessage {
+			userBlocks++
+		}
+	}
+	assert.Equal(t, len(history), userBlocks)
+	assert.False(t, m.hasEmittedScrollback,
+		"staging resume history must not mark terminal scrollback as emitted before first render")
+}
+
+func TestModel_PrepareInitialScrollbackSuppressesFirstFlush(t *testing.T) {
+	t.Parallel()
+
+	m := NewModel(ModelConfig{
+		InitialWidth: 100,
+		History: []UIEvent{
+			UIUserMessage{Content: "historical prompt"},
+			UIAssistantMessage{Content: "historical answer", IsFinal: true},
+		},
+	})
+
+	prepared, rendered := m.prepareInitialScrollback(100, 30)
+	stripped := ansi.Strip(rendered)
+	assert.Contains(t, stripped, "historical prompt")
+	assert.Contains(t, stripped, "historical answer")
+	assert.True(t, prepared.sizeReceived)
+	assert.True(t, prepared.hasEmittedScrollback)
+
+	updated, cmd := prepared.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	um := updated.(Model)
+	assert.True(t, um.sizeReceived)
+	assert.Empty(t, collectPrintln(cmd),
+		"resume startup must not ask Bubble Tea to insert history above the live input frame")
+}
+
+func TestNewModel_HistoryFinalEventClearsStaleApprovalPrompt(t *testing.T) {
+	t.Parallel()
+
+	m := NewModel(ModelConfig{
+		EventCh: make(chan UIEvent, 4),
+		History: []UIEvent{
+			UIApprovalRequest{
+				ApprovalID: "appr_1",
+				Message:    "Run this?",
+			},
+			UIAssistantMessage{
+				Content: "Done",
+				IsFinal: true,
+			},
+		},
+	})
+
+	assert.False(t, m.pendingApproval)
+	assert.Empty(t, m.approvalPromptText)
+	assert.Equal(t, "Send a message...", m.textInput.Placeholder)
+}
+
+func TestNewModel_HistoryKeepsTailApprovalPrompt(t *testing.T) {
+	t.Parallel()
+
+	m := NewModel(ModelConfig{
+		EventCh: make(chan UIEvent, 4),
+		History: []UIEvent{
+			UIApprovalRequest{
+				ApprovalID: "appr_1",
+				Message:    "Run this?",
+			},
+		},
+	})
+
+	assert.True(t, m.pendingApproval)
+	assert.NotEmpty(t, m.approvalPromptText)
+	assert.Empty(t, m.textInput.Placeholder)
+}
+
 // TestTranscriptSpacing_FullSequence drives a representative session through
 // the model and asserts every committed scrollback emission after the welcome
 // carries exactly one leading "\n". This is the regression test for #42472:
@@ -2439,7 +2794,7 @@ func TestView_LeadingBlankLine_Idle(t *testing.T) {
 	// After the leading blank, the next thing must be the prompt — not a
 	// second blank line. The textarea wraps the "❯ " prompt in ANSI escapes,
 	// so strip them before doing the prefix check.
-	stripped := stripansi.Strip(view)
+	stripped := ansi.Strip(view)
 	assert.True(t, strings.HasPrefix(stripped, "\n❯ "),
 		"idle View() must put the prompt immediately after the leading blank; got: %q", stripped)
 }
@@ -2452,7 +2807,7 @@ func TestView_LeadingBlankLine_Busy_SpinnerFlushWithPrompt(t *testing.T) {
 	m.height = 24
 	m.blocks = []block{{kind: blockBusy, label: "Thinking...", shimmer: shimmerVerb}}
 
-	view := stripansi.Strip(m.viewString())
+	view := ansi.Strip(m.viewString())
 	require.True(t, strings.HasPrefix(view, "\n"),
 		"View() must start with a blank line above the live frame; got: %q", view)
 
@@ -2479,7 +2834,7 @@ func TestLiveView_BlankBetweenLiveBlocks(t *testing.T) {
 		{kind: blockBusy, label: "Thinking...", shimmer: shimmerVerb},
 	}
 
-	live := stripansi.Strip(m.liveView())
+	live := ansi.Strip(m.liveView())
 	require.Contains(t, live, "PULUMI_LIVE")
 	require.Contains(t, live, "Thinking")
 
@@ -3052,4 +3407,112 @@ func TestRenderApprovalAuto_VerbVariants(t *testing.T) {
 			assert.Contains(t, b.rendered, tc.want)
 		})
 	}
+}
+
+// submitPrompt types text into the model and presses Enter, returning the
+// resulting model. The OutCh must be buffered enough for the test's sends.
+func submitPrompt(t *testing.T, m Model, text string) Model {
+	t.Helper()
+	m.textInput.SetValue(text)
+	m = pressKey(t, m, tea.KeyEnter)
+	// Submitting puts the model in the busy state; clear it as the agent does
+	// at the end of its turn so a follow-up submit isn't swallowed.
+	updated, _ := m.Update(UITaskIdle{})
+	return updated.(Model)
+}
+
+// pressKey feeds a single keypress to the model and returns the updated model.
+func pressKey(t *testing.T, m Model, code rune) Model {
+	t.Helper()
+	updated, _ := m.Update(tea.KeyPressMsg{Code: code})
+	return updated.(Model)
+}
+
+func TestModel_PromptHistory_RecallAfterSubmit(t *testing.T) {
+	t.Parallel()
+
+	outCh := make(chan outboundEvent, 4)
+	m := NewModel(ModelConfig{OutCh: outCh})
+	m = submitPrompt(t, m, "first")
+	m = submitPrompt(t, m, "second")
+	require.Empty(t, m.textInput.Value(), "input clears after submit")
+
+	// Up recalls the newest, then the older.
+	m = pressKey(t, m, tea.KeyUp)
+	assert.Equal(t, "second", m.textInput.Value())
+
+	m = pressKey(t, m, tea.KeyUp)
+	assert.Equal(t, "first", m.textInput.Value())
+
+	// Up at the oldest entry pins there.
+	m = pressKey(t, m, tea.KeyUp)
+	assert.Equal(t, "first", m.textInput.Value())
+
+	// Down walks back toward newer prompts, then past the newest to the
+	// (empty) draft.
+	m = pressKey(t, m, tea.KeyDown)
+	assert.Equal(t, "second", m.textInput.Value())
+
+	m = pressKey(t, m, tea.KeyDown)
+	assert.Empty(t, m.textInput.Value(), "Down past newest restores the empty draft")
+}
+
+func TestModel_PromptHistory_PreservesDraft(t *testing.T) {
+	t.Parallel()
+
+	outCh := make(chan outboundEvent, 4)
+	m := NewModel(ModelConfig{OutCh: outCh})
+	m = submitPrompt(t, m, "sent")
+
+	// Type an unsent draft, recall history with Up, then Down past the newest
+	// must restore the draft rather than leave the recalled prompt behind.
+	m.textInput.SetValue("draft in progress")
+	m = pressKey(t, m, tea.KeyUp)
+	assert.Equal(t, "sent", m.textInput.Value())
+
+	m = pressKey(t, m, tea.KeyDown)
+	assert.Equal(t, "draft in progress", m.textInput.Value())
+}
+
+func TestModel_PromptHistory_DedupesConsecutive(t *testing.T) {
+	t.Parallel()
+
+	outCh := make(chan outboundEvent, 4)
+	m := NewModel(ModelConfig{OutCh: outCh})
+	m = submitPrompt(t, m, "same")
+	m = submitPrompt(t, m, "same")
+
+	assert.Equal(t, []string{"same"}, m.history,
+		"consecutive duplicate prompts collapse to one history entry")
+}
+
+func TestModel_PromptHistory_MidBufferUpDoesNotRecall(t *testing.T) {
+	t.Parallel()
+
+	// With the cursor on a middle line of a multi-line draft, Up must move the
+	// cursor (textarea default) rather than recall history.
+	outCh := make(chan outboundEvent, 4)
+	m := NewModel(ModelConfig{OutCh: outCh})
+	m = submitPrompt(t, m, "history entry")
+
+	m.textInput.SetValue("line1\nline2\nline3")
+	m.textInput.MoveToEnd()
+	m.textInput.CursorUp() // now on the middle line
+	require.NotEqual(t, 0, m.textInput.Line(), "cursor must not be on the first line")
+
+	updated, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyUp})
+	m = updated.(Model)
+	assert.Equal(t, "line1\nline2\nline3", m.textInput.Value(),
+		"Up mid-buffer must not recall history")
+}
+
+func TestModel_PromptHistory_NoFooterHint(t *testing.T) {
+	t.Parallel()
+
+	// Per the issue, the shortcut is intentionally undocumented in the footer.
+	m := NewModel(ModelConfig{})
+	view := m.viewString()
+	assert.NotContains(t, view, "history")
+	assert.NotContains(t, view, "↑")
+	assert.NotContains(t, view, "↓")
 }

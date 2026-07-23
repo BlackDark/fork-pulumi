@@ -20,8 +20,10 @@ import (
 	"sync"
 	"sync/atomic"
 
+	pkgresource "github.com/pulumi/pulumi/pkg/v3/resource"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
 	"github.com/pulumi/pulumi/pkg/v3/secrets"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/logging"
@@ -59,7 +61,7 @@ type JournalSnapshotManager struct {
 	// newResources is a map of resources that have been added to the snapshot in this plan, keyed by the resource
 	// state.  This is used to track the added resources and their operation IDs, allowing us too delete
 	// them later if necessary.
-	newResources gsync.Map[*resource.State, int64]
+	newResources gsync.Map[*pkgresource.State, int64]
 	// A counter used to generate unique operation IDs for journal entries. Note that we use these
 	// sequential IDs to track the order of operations. This matters for reconstructing the Snapshot,
 	// because we need to know which operations were applied first, so dependencies are resolved correctly.
@@ -93,14 +95,16 @@ func (sm *JournalSnapshotManager) Close() error {
 type JournalEntryKind int
 
 const (
-	JournalEntryBegin            JournalEntryKind = 0
-	JournalEntrySuccess          JournalEntryKind = 1
-	JournalEntryFailure          JournalEntryKind = 2
-	JournalEntryRefreshSuccess   JournalEntryKind = 3
-	JournalEntryOutputs          JournalEntryKind = 4
-	JournalEntryWrite            JournalEntryKind = 5
-	JournalEntrySecretsManager   JournalEntryKind = 6
-	JournalEntryRebuiltBaseState JournalEntryKind = 7
+	JournalEntryBegin                 JournalEntryKind = 0
+	JournalEntrySuccess               JournalEntryKind = 1
+	JournalEntryFailure               JournalEntryKind = 2
+	JournalEntryRefreshSuccess        JournalEntryKind = 3
+	JournalEntryOutputs               JournalEntryKind = 4
+	JournalEntryWrite                 JournalEntryKind = 5
+	JournalEntrySecretsManager        JournalEntryKind = 6
+	JournalEntryRebuiltBaseState      JournalEntryKind = 7
+	JournalEntryExtensionParameterize JournalEntryKind = 8
+	JournalEntrySnippets              JournalEntryKind = 9
 )
 
 func (k JournalEntryKind) String() string {
@@ -121,6 +125,10 @@ func (k JournalEntryKind) String() string {
 		return "SecretsManager"
 	case JournalEntryRebuiltBaseState:
 		return "RebuiltBaseState"
+	case JournalEntryExtensionParameterize:
+		return "ExtensionParameterize"
+	case JournalEntrySnippets:
+		return "Snippets"
 	default:
 		return "Unknown"
 	}
@@ -149,9 +157,9 @@ type JournalEntry struct {
 	// The operation ID of the new resource that should be marked as deleted.
 	DeleteNew *int64
 	// The resource state associated with this journal entry.
-	State *resource.State
+	State *pkgresource.State
 	// The operation associated with this journal entry, if any.
-	Operation *resource.Operation
+	Operation *pkgresource.Operation
 	// If true, this journal entry can be elided and does not need to be written immediately.
 	ElideWrite bool
 	// If true, this journal entry is part of a refresh operation.
@@ -161,6 +169,15 @@ type JournalEntry struct {
 
 	// The new snapshot if this journal entry is part of a rebase operation.
 	NewSnapshot *deploy.Snapshot
+
+	// ExtensionRef and Extension carry the (ref, blob) pair produced by an
+	// ExtensionParameterizeStep so the journal can rebuild the live extensions
+	// map on replay. Only set for JournalEntryExtensionParameterize entries.
+	ExtensionRef *apitype.ExtensionRef
+	Extension    *apitype.Extension
+
+	// Snippets is the complete snippet list to persist when Kind is JournalEntrySnippets.
+	Snippets []resource.Snippet
 }
 
 func hasNewResource(entry JournalEntry) bool {
@@ -221,6 +238,12 @@ func (sm *JournalSnapshotManager) RegisterSecretsManager(secretsManager secrets.
 	return sm.addJournalEntry(journalEntry)
 }
 
+func (sm *JournalSnapshotManager) SetSnippets(snippets []resource.Snippet) error {
+	journalEntry := sm.newJournalEntry(JournalEntrySnippets, 0)
+	journalEntry.Snippets = snippets
+	return sm.addJournalEntry(journalEntry)
+}
+
 // findResourceInOldOrNew looks for a resource in either the base snapshot, or in the list of new
 // resources.
 //
@@ -233,7 +256,7 @@ func (sm *JournalSnapshotManager) RegisterSecretsManager(secretsManager secrets.
 //
 // The first return value if set is the index in the base snapshot, the second one is the operation ID.  Only
 // one of them will be set.
-func (sm *JournalSnapshotManager) findResourceInNewOrOld(toFind *resource.State) (*int64, *int64) {
+func (sm *JournalSnapshotManager) findResourceInNewOrOld(toFind *pkgresource.State) (*int64, *int64) {
 	if sm.baseSnapshot != nil {
 		for i, res := range sm.baseSnapshot.Resources {
 			if res == toFind {
@@ -276,11 +299,36 @@ func (sm *JournalSnapshotManager) BeginMutation(step deploy.Step) (SnapshotMutat
 		return sm.doRemovePendingReplace(step, operationID)
 	case deploy.OpImport, deploy.OpImportReplacement:
 		return sm.doImport(step, operationID)
+	case deploy.OpExtendParameterize:
+		return sm.doExtendParameterize(step)
 	}
 
 	contract.Failf("unknown StepOp: %s", step.Op())
 	return nil, nil
 }
+
+// doExtendParameterize records the (ref, blob) pair produced by an
+// ExtensionParameterizeStep into the journal so replay can rebuild the live
+// extensions map and rematerialize the snapshot's Extensions correctly.
+func (sm *JournalSnapshotManager) doExtendParameterize(step deploy.Step) (SnapshotMutation, error) {
+	ps, ok := step.(*deploy.ExtensionParameterizeStep)
+	contract.Assertf(ok, "doExtendParameterize called on non-ExtensionParameterizeStep: %T", step)
+	operationID := sm.operationIDCounter.Add(1)
+	entry := sm.newJournalEntry(JournalEntryExtensionParameterize, operationID)
+	ref := ps.Ref()
+	ext := ps.Extension()
+	entry.ExtensionRef = &ref
+	entry.Extension = &ext
+	if err := sm.addJournalEntry(entry); err != nil {
+		return nil, err
+	}
+	return &noopJournalMutation{}, nil
+}
+
+// noopJournalMutation is a SnapshotMutation that doesn't record anything in the journal.
+type noopJournalMutation struct{}
+
+func (*noopJournalMutation) End(_ deploy.Step, _ bool) error { return nil }
 
 // Write sets the base snapshot for this SnapshotManager. This is used to rebase the journal
 // on a new base snapshot, in particular when providers have been updated. We always expect
@@ -295,9 +343,11 @@ func (sm *JournalSnapshotManager) Write(base *deploy.Snapshot) error {
 	snapCopy := &deploy.Snapshot{
 		Manifest:          base.Manifest,
 		SecretsManager:    base.SecretsManager,
-		Resources:         make([]*resource.State, 0, len(base.Resources)),
-		PendingOperations: make([]resource.Operation, 0, len(base.PendingOperations)),
+		Resources:         make([]*pkgresource.State, 0, len(base.Resources)),
+		PendingOperations: make([]pkgresource.Operation, 0, len(base.PendingOperations)),
 		Metadata:          base.Metadata,
+		Extensions:        base.Extensions,
+		Snippets:          slices.Clone(base.Snippets),
 	}
 
 	// Copy the resources from the base snapshot to the new snapshot.
@@ -536,7 +586,7 @@ func (ssm *sameSnapshotMutation) End(step deploy.Step, successful bool) error {
 
 func (sm *JournalSnapshotManager) doCreate(step deploy.Step, operationID int64) (SnapshotMutation, error) {
 	logging.V(9).Infof("SnapshotManager.doCreate(%s)", step.URN())
-	op := resource.NewOperation(step.New(), resource.OperationTypeCreating)
+	op := pkgresource.NewOperation(step.New(), pkgresource.OperationTypeCreating)
 
 	journalEntry := sm.newJournalEntry(JournalEntryBegin, operationID)
 	journalEntry.Operation = &op
@@ -579,7 +629,7 @@ func (csm *createSnapshotMutation) End(step deploy.Step, successful bool) error 
 
 func (sm *JournalSnapshotManager) doUpdate(step deploy.Step, operationID int64) (SnapshotMutation, error) {
 	logging.V(9).Infof("SnapshotManager.doUpdate(%s)", step.URN())
-	op := resource.NewOperation(step.New(), resource.OperationTypeUpdating)
+	op := pkgresource.NewOperation(step.New(), pkgresource.OperationTypeUpdating)
 	journalEntry := sm.newJournalEntry(JournalEntryBegin, operationID)
 	journalEntry.Operation = &op
 	err := sm.addJournalEntry(journalEntry)
@@ -613,7 +663,7 @@ func (usm *updateSnapshotMutation) End(step deploy.Step, successful bool) error 
 
 func (sm *JournalSnapshotManager) doDelete(step deploy.Step, operationID int64) (SnapshotMutation, error) {
 	logging.V(9).Infof("SnapshotManager.doDelete(%s)", step.URN())
-	op := resource.NewOperation(step.Old(), resource.OperationTypeDeleting)
+	op := pkgresource.NewOperation(step.Old(), pkgresource.OperationTypeDeleting)
 	journalEntry := sm.newJournalEntry(JournalEntryBegin, operationID)
 	journalEntry.Operation = &op
 
@@ -643,7 +693,8 @@ func (dsm *deleteSnapshotMutation) End(step deploy.Step, successful bool) error 
 				step.Op() == deploy.OpDiscardReplaced ||
 				step.Op() == deploy.OpDeleteReplaced,
 			"Old must be unprotected (got %v) or the operation must be a replace (got %q)",
-			step.Old().Protect, step.Op())
+			step.Old().Protect, step.Op(),
+		)
 
 		if step.Old().PendingReplacement {
 			journalEntry.PendingReplacementOld,
@@ -672,7 +723,7 @@ func (rsm *replaceSnapshotMutation) End(step deploy.Step, successful bool) error
 
 func (sm *JournalSnapshotManager) doRead(step deploy.Step, operationID int64) (SnapshotMutation, error) {
 	logging.V(9).Infof("SnapshotManager.doRead(%s)", step.URN())
-	op := resource.NewOperation(step.New(), resource.OperationTypeReading)
+	op := pkgresource.NewOperation(step.New(), pkgresource.OperationTypeReading)
 	journalEntry := sm.newJournalEntry(JournalEntryBegin, operationID)
 	journalEntry.Operation = &op
 	err := sm.addJournalEntry(journalEntry)
@@ -784,7 +835,7 @@ func (rsm *removePendingReplaceSnapshotMutation) End(step deploy.Step, successfu
 
 func (sm *JournalSnapshotManager) doImport(step deploy.Step, operationID int64) (SnapshotMutation, error) {
 	logging.V(9).Infof("SnapshotManager.doImport(%s)", step.URN())
-	op := resource.NewOperation(step.New(), resource.OperationTypeImporting)
+	op := pkgresource.NewOperation(step.New(), pkgresource.OperationTypeImporting)
 	journalEntry := sm.newJournalEntry(JournalEntryBegin, operationID)
 	journalEntry.Operation = &op
 	err := sm.addJournalEntry(journalEntry)

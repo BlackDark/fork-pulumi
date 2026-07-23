@@ -25,8 +25,8 @@ import (
 	"github.com/blang/semver"
 
 	"github.com/pulumi/pulumi/pkg/v3/codegen/schema"
+	"github.com/pulumi/pulumi/pkg/v3/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 )
 
@@ -54,7 +54,7 @@ func (p *SyncProvider) GetSchema(
 	context.Context, plugin.GetSchemaRequest,
 ) (plugin.GetSchemaResponse, error) {
 	pkg := schema.PackageSpec{
-		Name:    p.Pkg().String(),
+		Name:    p.pkg().String(),
 		Version: syncVersion.String(),
 		Resources: map[string]schema.ResourceSpec{
 			"sync:index:Block": {
@@ -133,7 +133,7 @@ func (p *SyncProvider) waitWithTimeout(wg *sync.WaitGroup) error {
 	}
 }
 
-func (p *SyncProvider) Pkg() tokens.Package {
+func (p *SyncProvider) pkg() tokens.Package {
 	return "sync"
 }
 

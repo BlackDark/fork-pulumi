@@ -26,18 +26,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"path"
 	"strings"
 
 	"github.com/blang/semver"
 	"github.com/pulumi/pulumi/pkg/v3/pluginstorage"
+	"github.com/pulumi/pulumi/pkg/v3/registry"
+	"github.com/pulumi/pulumi/pkg/v3/resource/plugin"
 	"github.com/pulumi/pulumi/pkg/v3/util"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/registry"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/gitutil"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/util/logging"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 )
 
@@ -232,8 +232,8 @@ func registryResolution(
 			},
 			InstalledInWorkspace: installed,
 		}
-		logging.V(3).Infof("Resolved package %q via the registry to plugin %#v (installedInWorkspace=%t)\n",
-			spec.Source, plugin, installed)
+		slog.Info("Resolved package via the registry to plugin",
+			"package", spec.Source, "plugin", plugin, "installed-in-workspace", installed)
 
 		return plugin, nil
 	}
@@ -257,9 +257,26 @@ func registryResolution(
 		Pkg:                  pkgDescriptor,
 		InstalledInWorkspace: installed,
 	}
-	logging.V(3).Infof("Resolved package %q via the registry to package %#v (installedInWorkspace=%t)\n",
-		spec.Source, pkg, installed)
+	slog.Info("Resolved package via the registry to package",
+		"package", spec.Source, "resolution", pkg, "installed-in-workspace", installed)
 	return pkg, nil
+}
+
+func IsPluginInstalled(
+	ctx context.Context,
+	plugin workspace.PluginDescriptor, ws pluginstorage.Context, options Options,
+) (bool, *semver.Version, error) {
+	if ws.HasPlugin(ctx, plugin) {
+		return true, plugin.Version, nil
+	}
+
+	if plugin.Version == nil && options.ResolveVersionWithLocalWorkspace {
+		has, version, err := ws.HasPluginGTE(ctx, plugin)
+		if err != nil || has {
+			return has, version, err
+		}
+	}
+	return false, nil, nil
 }
 
 func Resolve(
@@ -269,7 +286,7 @@ func Resolve(
 	spec workspace.PackageSpec,
 	options Options,
 ) (Resolution, error) {
-	logging.V(3).Infof("Resolving package from %#v\n", spec)
+	slog.InfoContext(ctx, "Resolving package", "spec", spec)
 	if plugin.IsLocalPluginPath(ctx, spec.Source) {
 		return PathResolution{
 			Path:                 spec.Source,
@@ -284,45 +301,32 @@ func Resolve(
 	}
 
 	if options.AllowNonInvertableLocalWorkspaceResolution {
-		if ws.HasPlugin(ctx, naivePackageDescriptor.PluginDescriptor) {
-			return naiveResolution(spec, naivePackageDescriptor, true), nil
+		installed, atVersion, err := IsPluginInstalled(ctx, naivePackageDescriptor.PluginDescriptor, ws, options)
+		if err != nil {
+			return nil, err
 		}
-
-		if naivePackageDescriptor.Version == nil {
-			has, version, err := ws.HasPluginGTE(ctx, naivePackageDescriptor.PluginDescriptor)
-			if err != nil {
-				return nil, err
+		if installed {
+			if atVersion != nil {
+				spec.Version = atVersion.String()
+				naivePackageDescriptor.Version = atVersion
 			}
-			if has {
-				if version != nil {
-					naivePackageDescriptor.Version = version
-					spec.Version = version.String()
-				}
-				return naiveResolution(spec, naivePackageDescriptor, true), nil
-			}
+			return naiveResolution(spec, naivePackageDescriptor, true), nil
 		}
 	}
 
 	remoteResolution := func() (Resolution, error) {
-		logging.V(3).Infof("Resolved package %#v to an external source %#v\n",
-			spec, naivePackageDescriptor)
-		// If we have the exact version installed, then use that
-		if ws.HasPlugin(ctx, naivePackageDescriptor.PluginDescriptor) {
-			return naiveResolution(spec, naivePackageDescriptor, true), nil
+		slog.InfoContext(ctx, "Resolved package to an external source",
+			"spec", spec, "descriptor", naivePackageDescriptor)
+		installed, atVersion, err := IsPluginInstalled(ctx, naivePackageDescriptor.PluginDescriptor, ws, options)
+		if err != nil {
+			return nil, err
 		}
-		// If we don't have a version specified and we are referencing the local workspace
-		if naivePackageDescriptor.Version == nil && options.ResolveVersionWithLocalWorkspace {
-			has, version, err := ws.HasPluginGTE(ctx, naivePackageDescriptor.PluginDescriptor)
-			if err != nil {
-				return nil, err
+		if installed {
+			if atVersion != nil {
+				naivePackageDescriptor.Version = atVersion
+				spec.Version = atVersion.String()
 			}
-			if has {
-				if version != nil {
-					naivePackageDescriptor.Version = version
-					spec.Version = version.String()
-				}
-				return naiveResolution(spec, naivePackageDescriptor, true), nil
-			}
+			return naiveResolution(spec, naivePackageDescriptor, true), nil
 		}
 
 		// We still don't have a version, so let's look up the latest version.
@@ -414,11 +418,11 @@ func Resolve(
 	}
 
 	if registryQueryErr != nil {
-		logging.V(3).Infof("Failed to resolve package %#v\n", spec)
+		slog.InfoContext(ctx, "Failed to resolve package", "spec", spec)
 		return nil, registryQueryErr
 	}
 
-	logging.V(3).Infof("Failed to resolve package %#v\n", spec)
+	slog.InfoContext(ctx, "Failed to resolve package", "spec", spec)
 	return nil, &PackageNotFoundError{
 		Package:     spec.Source,
 		Version:     spec.Version,

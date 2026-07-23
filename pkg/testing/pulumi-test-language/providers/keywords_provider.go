@@ -18,12 +18,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 
 	"github.com/blang/semver"
 
 	"github.com/pulumi/pulumi/pkg/v3/codegen/schema"
+	"github.com/pulumi/pulumi/pkg/v3/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 )
 
@@ -66,7 +67,7 @@ func (p *KeywordsProvider) Configure(
 	return plugin.ConfigureResponse{}, nil
 }
 
-func (p *KeywordsProvider) Pkg() tokens.Package {
+func (p *KeywordsProvider) pkg() tokens.Package {
 	return "keywords"
 }
 
@@ -96,7 +97,7 @@ func (p *KeywordsProvider) GetSchema(
 	}
 
 	pkg := schema.PackageSpec{
-		Name:      p.Pkg().String(),
+		Name:      p.pkg().String(),
 		Version:   p.version(),
 		Resources: resources,
 	}
@@ -136,12 +137,7 @@ func (p *KeywordsProvider) CheckConfig(
 }
 
 func (p *KeywordsProvider) isValidResourceType(t tokens.Type) bool {
-	for _, rt := range p.resourceTypes() {
-		if string(t) == rt {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(p.resourceTypes(), string(t))
 }
 
 func (p *KeywordsProvider) Check(

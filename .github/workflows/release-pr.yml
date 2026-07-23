@@ -35,15 +35,21 @@ jobs:
     name: version bump
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
-          ref: ${{ inputs.ref }}
-      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5
+          # `inputs.ref` is the release tag, which points at a commit created
+          # before the freeze PR landed. Branch off master so we pick up the
+          # freeze PR's changes (sdk/.version bump, .release-pending marker).
+          ref: master
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
         with:
           go-version-file: sdk/go.mod
-      - uses: miniscruff/changie-action@v2
+      - uses: ./.github/actions/retry
         with:
-          version: v1.21.0
+          action: jdx/mise-action@v2
+          with: |
+            experimental: true
       - name: Create PR
         env:
           PULUMI_VERSION: ${{ inputs.version }}
@@ -53,6 +59,7 @@ jobs:
           set -euo pipefail
           git switch --create "automation/release-v${PULUMI_VERSION}"
 
+          python3 scripts/changie-pr-lookup.py
           changie batch "${PULUMI_VERSION}"
           changie merge
 
@@ -68,6 +75,9 @@ jobs:
             go get -u "github.com/pulumi/pulumi/sdk/v3@v${PULUMI_VERSION}"
           )
           make tidy_fix
+          # Clear the release-in-progress marker dropped by set-version.py.
+          # Merging this PR re-opens the queue to other PRs.
+          rm -f .release-pending
           git add -A
           git commit -m "chore: post-release go.mod updates"
 

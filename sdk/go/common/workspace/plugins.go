@@ -42,7 +42,7 @@ import (
 	"github.com/blang/semver"
 	"github.com/cheggaaa/pb"
 	"github.com/djherbis/times"
-	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v6/plumbing"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
@@ -80,6 +80,25 @@ var pluginDownloadURLOverrides string
 
 // pluginDownloadURLOverridesParsed is the parsed array from `pluginDownloadURLOverrides`.
 var pluginDownloadURLOverridesParsed pluginDownloadOverrideArray
+
+// pluginHostOverrides is a variable instead of a constant so it can be set using the `-X`
+// ldflag at build time, if necessary. When non-empty, it is parsed into
+// `pluginHostOverridesParsed` in `init()`. The expected format is
+// `host1=https://proxy1/base/path,host2=https://proxy2`.
+var pluginHostOverrides string
+
+// hostOverride holds the parsed components of a single entry in pluginHostOverridesParsed.
+type hostOverride struct {
+	scheme string // replacement scheme, e.g. "https"
+	host   string // replacement host, e.g. "testartifactory.my.de"
+	// path is the base path prefix to prepend to every request path, e.g.
+	// "/artifactory/api-github-generic-remote". May be empty. Never has a trailing slash.
+	path string
+}
+
+// pluginHostOverridesParsed is the parsed map from `pluginHostOverrides`.
+// Keys are original hostnames (optionally with port), e.g. "api.github.com".
+var pluginHostOverridesParsed map[string]hostOverride
 
 // pluginDownloadURLOverride represents a plugin download URL override, parsed from `pluginDownloadURLOverrides`.
 type pluginDownloadURLOverride struct {
@@ -126,6 +145,64 @@ func init() {
 	if pluginDownloadURLOverridesParsed, err = parsePluginDownloadURLOverrides(overrides); err != nil {
 		panic(fmt.Errorf("error parsing `pluginDownloadURLOverrides`: %w", err))
 	}
+
+	// Parse host overrides. Environment variable takes precedence over compile-time flags.
+	hostOverrides := pluginHostOverrides
+	if v := env.PluginHostOverrides.Value(); v != "" {
+		hostOverrides = v
+	}
+	if pluginHostOverridesParsed, err = parsePluginHostOverrides(hostOverrides); err != nil {
+		panic(fmt.Errorf("error parsing `pluginHostOverrides`: %w", err))
+	}
+}
+
+// parsePluginHostOverrides parses an overrides string with the expected format
+// `host1=https://proxy1/base/path,host2=https://proxy2`.
+//
+// The key is the original hostname (optionally with port) as it appears in the request URL.
+// The value is the full base URL of the proxy. If the value has no scheme, "https" is assumed.
+// Any path in the proxy base URL is prepended to the original request path, which allows
+// reverse proxies that expose upstream hosts at a subpath (e.g. Artifactory generic remotes).
+//
+// Examples:
+//
+//	api.github.com=https://artifactory.example.com/artifactory/github-api-remote
+//	github.com=https://artifactory.example.com/artifactory/github-com-remote
+//	api.github.com=github-api.simpleproxy.example.com  (bare host, https assumed)
+func parsePluginHostOverrides(overrides string) (map[string]hostOverride, error) {
+	result := map[string]hostOverride{}
+	if overrides == "" {
+		return result, nil
+	}
+	for _, pair := range strings.Split(overrides, ",") {
+		// SplitN with n=2 so that "://" and "=" inside the proxy URL are not treated as
+		// delimiters — only the first "=" separates the key from the value.
+		parts := strings.SplitN(pair, "=", 2)
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			return nil, fmt.Errorf(
+				"expected format to be \"host1=https://proxy1/path,host2=https://proxy2\"; got %q",
+				overrides)
+		}
+		from := parts[0]
+		rawTo := parts[1]
+		// Accept bare hostnames for convenience; assume https.
+		if !strings.Contains(rawTo, "://") {
+			rawTo = "https://" + rawTo
+		}
+		toURL, err := url.Parse(rawTo)
+		if err != nil {
+			return nil, fmt.Errorf("invalid proxy base URL %q: %w", parts[1], err)
+		}
+		if toURL.Host == "" {
+			return nil, fmt.Errorf("proxy base URL %q has no host", parts[1])
+		}
+		result[from] = hostOverride{
+			scheme: toURL.Scheme,
+			host:   toURL.Host,
+			path:   strings.TrimSuffix(toURL.Path, "/"),
+		}
+	}
+	return result, nil
 }
 
 // parsePluginDownloadURLOverrides parses an overrides string with the expected format `regexp1=URL1,regexp2=URL2`.
@@ -967,9 +1044,14 @@ type PackageDescriptor struct {
 	// A specification for the plugin that provides the package.
 	PluginDescriptor
 
-	// An optional parameterization to apply to the providing plugin to produce
-	// the package.
+	// An optional replacement parameterization to apply to the providing plugin
+	// to produce the package.
 	Parameterization *Parameterization
+
+	// An optional extension parameterization to apply to the providing plugin to
+	// produce the package. Extension parameterizations share the base plugin's
+	// source and are not separate providers.
+	ExtensionParameterization *Parameterization
 }
 
 // A resolved plugin with parameterization arguments.
@@ -992,6 +1074,10 @@ func NewPackageDescriptor(spec PluginDescriptor, parameterization *Parameterizat
 
 // PackageName returns the name of the package.
 func (pd PackageDescriptor) PackageName() string {
+	// Extension parameterization takes precedence over replacement parameterization.
+	if pd.ExtensionParameterization != nil {
+		return pd.ExtensionParameterization.Name
+	}
 	if pd.Parameterization != nil {
 		return pd.Parameterization.Name
 	}
@@ -1000,6 +1086,10 @@ func (pd PackageDescriptor) PackageName() string {
 
 // PackageVersion returns the version of the package.
 func (pd PackageDescriptor) PackageVersion() *semver.Version {
+	// Extension parameterization takes precedence over replacement parameterization.
+	if pd.ExtensionParameterization != nil {
+		return &pd.ExtensionParameterization.Version
+	}
 	if pd.Parameterization != nil {
 		return &pd.Parameterization.Version
 	}
@@ -1009,9 +1099,11 @@ func (pd PackageDescriptor) PackageVersion() *semver.Version {
 func (pd PackageDescriptor) String() string {
 	name := pd.Name
 	version := pd.Version
-	if pd.Parameterization != nil {
-		name = pd.Parameterization.Name
-		version = &pd.Parameterization.Version
+	// Extension parameterization takes precedence over replacement parameterization.
+	if pd.ExtensionParameterization != nil {
+		name, version = pd.ExtensionParameterization.Name, &pd.ExtensionParameterization.Version
+	} else if pd.Parameterization != nil {
+		name, version = pd.Parameterization.Name, &pd.Parameterization.Version
 	}
 
 	var v string
@@ -1359,6 +1451,24 @@ func (spec PluginDescriptor) String() string {
 	return spec.Name + version
 }
 
+// PluginFS captures the filesystem operations used by PluginInfo (see Delete and
+// setFileMetadata). It exists so that plugin removal and metadata lookups can be exercised
+// without touching the real filesystem. A PluginInfo with a nil FS uses the real filesystem.
+type PluginFS interface {
+	Stat(name string) (os.FileInfo, error)
+	Remove(name string) error
+	RemoveAll(path string) error
+	GetTimes(fi os.FileInfo) times.Timespec
+}
+
+// osPluginFS is the default PluginFS, backed by the os package.
+type osPluginFS struct{}
+
+func (osPluginFS) Stat(name string) (os.FileInfo, error)  { return os.Stat(name) }
+func (osPluginFS) Remove(name string) error               { return os.Remove(name) }
+func (osPluginFS) RemoveAll(path string) error            { return os.RemoveAll(path) }
+func (osPluginFS) GetTimes(fi os.FileInfo) times.Timespec { return times.Get(fi) }
+
 // PluginInfo provides basic information about a plugin.  Each plugin gets installed into a system-wide
 // location, by default `~/.pulumi/plugins/<kind>-<name>-<version>/`.  A plugin may contain multiple files,
 // however the primary loadable executable must be named `pulumi-<kind>-<name>`.
@@ -1368,10 +1478,21 @@ type PluginInfo struct {
 	Kind    apitype.PluginKind // the kind of the plugin (language, resource, etc).
 	Version *semver.Version    // the plugin's semantic version, if present.
 
+	// FS is the filesystem backing the plugin's on-disk state. A nil FS uses the real filesystem.
+	FS PluginFS
+
 	installTime  time.Time // cached time the plugin was installed.
 	lastUsedTime time.Time // cached last time the plugin was used.
 
 	size uint64 // cached plugin size in bytes
+}
+
+// filesystem returns the plugin's PluginFS, defaulting to the real filesystem when unset.
+func (info *PluginInfo) filesystem() PluginFS {
+	if info.FS != nil {
+		return info.FS
+	}
+	return osPluginFS{}
 }
 
 // InstallTime returns the time the plugin was installed.
@@ -1434,14 +1555,15 @@ func (info PluginInfo) String() string {
 // Delete removes the plugin from the cache.  It also deletes any supporting files in the cache, which includes
 // any files that contain the same prefix as the plugin itself.
 func (info *PluginInfo) Delete() error {
+	fs := info.filesystem()
 	dir := info.Path
-	if err := os.RemoveAll(dir); err != nil {
+	if err := fs.RemoveAll(dir); err != nil {
 		return err
 	}
 	// Attempt to delete any leftover .partial or .lock files.
 	// Don't fail the operation if we can't delete these.
-	contract.IgnoreError(os.Remove(dir + ".partial"))
-	contract.IgnoreError(os.Remove(dir + ".lock"))
+	contract.IgnoreError(fs.Remove(dir + ".partial"))
+	contract.IgnoreError(fs.Remove(dir + ".lock"))
 	return nil
 }
 
@@ -1452,13 +1574,13 @@ func (info *PluginInfo) setFileMetadata() error {
 	}
 
 	// Get the file info.
-	file, err := os.Stat(info.Path)
+	file, err := info.filesystem().Stat(info.Path)
 	if err != nil {
 		return err
 	}
 
 	// Next get the access times from the plugin folder.
-	tinfo := times.Get(file)
+	tinfo := info.filesystem().GetTimes(file)
 
 	if tinfo.HasChangeTime() {
 		info.installTime = tinfo.ChangeTime()
@@ -1569,6 +1691,30 @@ func buildHTTPRequest(ctx context.Context, pluginEndpoint string, authorization 
 		return nil, err
 	}
 
+	// Apply any host overrides from PULUMI_PLUGIN_HOST_OVERRIDES.  The rewrite happens here,
+	// at the single point where all plugin download requests are constructed, so it is
+	// transparently effective for every source type (GitHub, GitLab, get.pulumi.com, custom
+	// HTTP sources) without requiring any source-specific logic.
+	//
+	// Note: mutating req.URL.Host means that downstream error helpers which inspect the host
+	// (e.g. newDownloadError's private-repo hint for api.github.com 404s) will see the proxy
+	// hostname instead of the original one.  Those hints are best-effort and this is an
+	// acceptable trade-off for the simplicity of a single rewrite point.
+	if override, ok := pluginHostOverridesParsed[req.URL.Host]; ok {
+		original := req.URL.String()
+		req.URL.Scheme = override.scheme
+		req.URL.Host = override.host
+		req.Host = req.URL.Host
+		if override.path != "" {
+			req.URL.Path = override.path + req.URL.Path
+			// Keep RawPath in sync when the original URL had percent-encoded path segments.
+			if req.URL.RawPath != "" {
+				req.URL.RawPath = override.path + req.URL.RawPath
+			}
+		}
+		logging.V(9).Infof("plugin host override: %s -> %s", original, req.URL)
+	}
+
 	userAgent := fmt.Sprintf("pulumi-cli/1 (%s; %s)", version.Version, runtime.GOOS)
 	req.Header.Set("User-Agent", userAgent)
 
@@ -1649,6 +1795,9 @@ func newGithubPrivateRepoError(statusCode int, url *url.URL) error {
 }
 
 // Create a new downloadError.
+// Note: when PULUMI_PLUGIN_HOST_OVERRIDES is set the host in url will be the proxy hostname
+// rather than "api.github.com", so the private-repo hint below will not fire for proxied
+// requests. This is a known, accepted limitation of the host-rewrite approach.
 func newDownloadError(statusCode int, url *url.URL, header http.Header) error {
 	if url.Host == "api.github.com" && statusCode == 404 {
 		return newGithubPrivateRepoError(statusCode, url)
@@ -2012,7 +2161,6 @@ func IsPluginBundled(kind apitype.PluginKind, name string) bool {
 		(kind == apitype.LanguagePlugin && name == "dotnet") ||
 		(kind == apitype.LanguagePlugin && name == "yaml") ||
 		(kind == apitype.LanguagePlugin && name == "java") ||
-		(kind == apitype.LanguagePlugin && name == "hcl") ||
 		(kind == apitype.LanguagePlugin && name == "pcl") ||
 		(kind == apitype.ResourcePlugin && name == "pulumi-nodejs") ||
 		(kind == apitype.ResourcePlugin && name == "pulumi-python")
@@ -2390,19 +2538,18 @@ func SelectCompatiblePlugin(
 
 // ReadCloserProgressBar displays a progress bar for the given closer and returns a wrapper closer to manipulate it.
 func ReadCloserProgressBar(
-	closer io.ReadCloser, size int64, message string, colorization colors.Colorization,
+	closer io.ReadCloser, w io.Writer, size int64, message string, colorization colors.Colorization,
 ) io.ReadCloser {
-	if size == -1 {
-		return closer
-	}
-
-	if !cmdutil.Interactive() {
+	if size == -1 || !cmdutil.Interactive() {
+		// We can't render a progress bar (unknown size, or non-interactive output), but still tell the
+		// user what's happening.
+		fmt.Fprintln(w, colorization.Colorize(colors.SpecUnimportant+message+colors.Reset))
 		return closer
 	}
 
 	// If we know the length of the download, show a progress bar.
 	bar := pb.New(int(size))
-	bar.Output = os.Stderr
+	bar.Output = w
 	bar.Prefix(colorization.Colorize(colors.SpecUnimportant + message + ":"))
 	bar.Postfix(colorization.Colorize(colors.Reset))
 	bar.SetMaxWidth(80)
@@ -2542,6 +2689,6 @@ func (bc *barCloser) Read(dest []byte) (int, error) {
 }
 
 func (bc *barCloser) Close() error {
-	bc.bar.FinishPrint("\r")
+	bc.bar.Finish()
 	return bc.readCloser.Close()
 }

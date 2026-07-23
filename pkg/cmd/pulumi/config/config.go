@@ -29,11 +29,10 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 
-	"github.com/pulumi/esc"
-	"github.com/pulumi/esc/cmd/esc/cli"
 	"github.com/pulumi/pulumi/pkg/v3/backend"
 	"github.com/pulumi/pulumi/pkg/v3/backend/backenderr"
 	"github.com/pulumi/pulumi/pkg/v3/backend/display"
+	"github.com/pulumi/pulumi/pkg/v3/cmd/esc/cli"
 	cmdBackend "github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/backend"
 	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/constrictor"
 	cmdStack "github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/stack"
@@ -46,6 +45,7 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag/colors"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/esc"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/cmdutil"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
@@ -60,6 +60,7 @@ type encrypterFactory interface {
 
 func NewConfigCmd(ws pkgWorkspace.Context) *cobra.Command {
 	var stack string
+	var configFile string
 	var showSecrets bool
 	var jsonOut bool
 	var open bool
@@ -76,7 +77,12 @@ func NewConfigCmd(ws pkgWorkspace.Context) *cobra.Command {
 				Color: cmdutil.GetGlobalColorization(),
 			}
 
-			project, _, err := ws.ReadProject()
+			cwd, err := os.Getwd()
+			if err != nil {
+				return fmt.Errorf("getting current working directory: %w", err)
+			}
+
+			project, _, err := ws.ReadProject(cwd)
 			if err != nil {
 				return err
 			}
@@ -89,12 +95,13 @@ func NewConfigCmd(ws pkgWorkspace.Context) *cobra.Command {
 				stack,
 				cmdStack.OfferNew|cmdStack.SetCurrent,
 				opts,
+				configFile,
 			)
 			if err != nil {
 				return err
 			}
 
-			ps, err := cmdStack.LoadProjectStack(ctx, cmdutil.Diag(), project, stack)
+			ps, err := cmdStack.LoadProjectStack(ctx, cmdutil.Diag(), project, stack, configFile)
 			if err != nil {
 				return err
 			}
@@ -121,49 +128,56 @@ func NewConfigCmd(ws pkgWorkspace.Context) *cobra.Command {
 				showSecrets,
 				jsonOut,
 				openEnvironment,
+				configFile,
 			)
 		},
 	}
 
 	cmd.Flags().BoolVar(
 		&showSecrets, "show-secrets", false,
-		"Show secret values when listing config instead of displaying blinded values")
+		"Show secret values when listing config instead of displaying blinded values",
+	)
 	cmd.Flags().BoolVar(
 		&open, "open", false,
 		"Open and resolve any environments listed in the stack configuration. "+
-			"Defaults to true if --show-secrets is set, false otherwise")
+			"Defaults to true if --show-secrets is set, false otherwise",
+	)
 	cmd.Flags().BoolVarP(
 		&jsonOut, "json", "j", false,
-		"Emit output as JSON")
+		"Emit output as JSON",
+	)
 	cmd.PersistentFlags().StringVarP(
 		&stack, "stack", "s", "",
-		"The name of the stack to operate on. Defaults to the current stack")
+		"The name of the stack to operate on. Defaults to the current stack",
+	)
 	cmd.PersistentFlags().StringVar(
-		&cmdStack.ConfigFile, "config-file", "",
-		"Use the configuration values in the specified file rather than detecting the file name")
+		&configFile, "config-file", "",
+		"Use the configuration values in the specified file rather than detecting the file name",
+	)
 
 	constrictor.AttachArguments(cmd, constrictor.NoArgs)
 
-	cmd.AddCommand(newConfigGetCmd(ws, &stack))
-	cmd.AddCommand(newConfigRmCmd(ws, &stack))
-	cmd.AddCommand(newConfigRmAllCmd(ws, &stack))
-	cmd.AddCommand(newConfigSetCmd(ws, &stack))
+	cmd.AddCommand(newConfigGetCmd(ws, &stack, &configFile))
+	cmd.AddCommand(newConfigRemoveCmd(ws, &stack, &configFile))
+	cmd.AddCommand(newConfigRemoveAllCmd(ws, &stack, &configFile))
+	cmd.AddCommand(newConfigSetCmd(ws, &stack, &configFile))
 	ssml := cmdStack.NewStackSecretsManagerLoaderFromEnv()
-	cmd.AddCommand(newConfigSetAllCmd(ws, &stack, cmdBackend.DefaultLoginManager, &ssml))
-	cmd.AddCommand(newConfigRefreshCmd(ws, &stack, cmdBackend.DefaultLoginManager))
-	cmd.AddCommand(newConfigCopyCmd(ws, &stack))
-	cmd.AddCommand(newConfigEnvCmd(ws, &stack))
+	cmd.AddCommand(newConfigSetAllCmd(ws, &stack, cmdBackend.DefaultLoginManager, &ssml, &configFile))
+	cmd.AddCommand(newConfigRefreshCmd(ws, &stack, cmdBackend.DefaultLoginManager, &configFile))
+	cmd.AddCommand(newConfigCopyCmd(ws, &stack, &configFile))
+	cmd.AddCommand(newConfigEnvCmd(ws, &stack, &configFile))
 
 	return cmd
 }
 
-func newConfigCopyCmd(ws pkgWorkspace.Context, stack *string) *cobra.Command {
+func newConfigCopyCmd(ws pkgWorkspace.Context, stack *string, configFile *string) *cobra.Command {
 	var path bool
 	var destinationStackName string
 
-	cpCommand := &cobra.Command{
-		Use:   "cp",
-		Short: "Copy config to another stack",
+	copyCommand := &cobra.Command{
+		Use:     "copy",
+		Aliases: []string{"cp"},
+		Short:   "Copy config to another stack",
 		Long: "Copies the config from the current stack to the destination stack. If `key` is omitted,\n" +
 			"then all of the config from the current stack will be copied to the destination stack.",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -172,7 +186,12 @@ func newConfigCopyCmd(ws pkgWorkspace.Context, stack *string) *cobra.Command {
 				Color: cmdutil.GetGlobalColorization(),
 			}
 
-			project, _, err := ws.ReadProject()
+			cwd, err := os.Getwd()
+			if err != nil {
+				return fmt.Errorf("getting current working directory: %w", err)
+			}
+
+			project, _, err := ws.ReadProject(cwd)
 			if err != nil {
 				return err
 			}
@@ -186,6 +205,7 @@ func newConfigCopyCmd(ws pkgWorkspace.Context, stack *string) *cobra.Command {
 				*stack,
 				cmdStack.SetCurrent,
 				opts,
+				*configFile,
 			)
 			if err != nil {
 				return err
@@ -193,7 +213,7 @@ func newConfigCopyCmd(ws pkgWorkspace.Context, stack *string) *cobra.Command {
 			if currentStack.Ref().Name().String() == destinationStackName {
 				return errors.New("current stack and destination stack are the same")
 			}
-			currentProjectStack, err := cmdStack.LoadProjectStack(ctx, cmdutil.Diag(), project, currentStack)
+			currentProjectStack, err := cmdStack.LoadProjectStack(ctx, cmdutil.Diag(), project, currentStack, *configFile)
 			if err != nil {
 				return err
 			}
@@ -207,11 +227,14 @@ func newConfigCopyCmd(ws pkgWorkspace.Context, stack *string) *cobra.Command {
 				destinationStackName,
 				cmdStack.LoadOnly,
 				opts,
+				*configFile,
 			)
 			if err != nil {
 				return err
 			}
-			destinationProjectStack, err := cmdStack.LoadProjectStack(ctx, cmdutil.Diag(), project, destinationStack)
+			destinationProjectStack, err := cmdStack.LoadProjectStack(
+				ctx, cmdutil.Diag(), project, destinationStack, *configFile,
+			)
 			if err != nil {
 				return err
 			}
@@ -239,6 +262,7 @@ func newConfigCopyCmd(ws pkgWorkspace.Context, stack *string) *cobra.Command {
 					currentProjectStack,
 					destinationStack,
 					destinationProjectStack,
+					*configFile,
 				)
 			}
 
@@ -257,7 +281,7 @@ func newConfigCopyCmd(ws pkgWorkspace.Context, stack *string) *cobra.Command {
 			// The use of `requiresSaving` here ensures that there was actually some config
 			// that needed saved, otherwise it's an unnecessary save call
 			if requiresSaving {
-				err := cmdStack.SaveProjectStack(ctx, destinationStack, destinationProjectStack)
+				err := cmdStack.SaveProjectStack(ctx, destinationStack, destinationProjectStack, *configFile)
 				if err != nil {
 					return err
 				}
@@ -267,24 +291,26 @@ func newConfigCopyCmd(ws pkgWorkspace.Context, stack *string) *cobra.Command {
 		},
 	}
 
-	constrictor.AttachArguments(cpCommand, &constrictor.Arguments{
+	constrictor.AttachArguments(copyCommand, &constrictor.Arguments{
 		Arguments: []constrictor.Argument{
 			{Name: "key"},
 		},
 		Required: 0,
 	})
 
-	cpCommand.PersistentFlags().BoolVar(
+	copyCommand.PersistentFlags().BoolVar(
 		&path, "path", false,
-		"The key contains a path to a property in a map or list to set")
-	cpCommand.PersistentFlags().StringVarP(
+		"The key contains a path to a property in a map or list to set",
+	)
+	copyCommand.PersistentFlags().StringVarP(
 		&destinationStackName, "dest", "d", "",
-		"The name of the new stack to copy the config to")
+		"The name of the new stack to copy the config to",
+	)
 
-	return cpCommand
+	return copyCommand
 }
 
-func newConfigGetCmd(ws pkgWorkspace.Context, stack *string) *cobra.Command {
+func newConfigGetCmd(ws pkgWorkspace.Context, stack *string, configFile *string) *cobra.Command {
 	var jsonOut bool
 	var open bool
 	var path bool
@@ -312,6 +338,7 @@ func newConfigGetCmd(ws pkgWorkspace.Context, stack *string) *cobra.Command {
 				*stack,
 				cmdStack.OfferNew|cmdStack.SetCurrent,
 				opts,
+				*configFile,
 			)
 			if err != nil {
 				return err
@@ -323,7 +350,7 @@ func newConfigGetCmd(ws pkgWorkspace.Context, stack *string) *cobra.Command {
 			}
 
 			ssml := cmdStack.NewStackSecretsManagerLoaderFromEnv()
-			return getConfig(ctx, cmd.OutOrStdout(), cmdutil.Diag(), ssml, ws, s, key, path, jsonOut, open)
+			return getConfig(ctx, cmd.OutOrStdout(), cmdutil.Diag(), ssml, ws, s, key, path, jsonOut, open, *configFile)
 		},
 	}
 	constrictor.AttachArguments(getCmd, &constrictor.Arguments{
@@ -335,23 +362,27 @@ func newConfigGetCmd(ws pkgWorkspace.Context, stack *string) *cobra.Command {
 
 	getCmd.Flags().BoolVarP(
 		&jsonOut, "json", "j", false,
-		"Emit output as JSON")
+		"Emit output as JSON",
+	)
 	getCmd.Flags().BoolVar(
 		&open, "open", true,
-		"Open and resolve any environments listed in the stack configuration")
+		"Open and resolve any environments listed in the stack configuration",
+	)
 	getCmd.PersistentFlags().BoolVar(
 		&path, "path", false,
-		"The key contains a path to a property in a map or list to get")
+		"The key contains a path to a property in a map or list to get",
+	)
 
 	return getCmd
 }
 
-func newConfigRmCmd(ws pkgWorkspace.Context, stack *string) *cobra.Command {
+func newConfigRemoveCmd(ws pkgWorkspace.Context, stack *string, configFile *string) *cobra.Command {
 	var path bool
 
 	rmCmd := &cobra.Command{
-		Use:   "rm",
-		Short: "Remove configuration value",
+		Use:     "remove",
+		Aliases: []string{"rm", "delete"},
+		Short:   "Remove configuration value",
 		Long: "Remove configuration value.\n\n" +
 			"The `--path` flag can be used to remove a value inside a map or list:\n\n" +
 			"  - `pulumi config rm --path outer.inner` will remove the `inner` key, " +
@@ -364,7 +395,12 @@ func newConfigRmCmd(ws pkgWorkspace.Context, stack *string) *cobra.Command {
 				Color: cmdutil.GetGlobalColorization(),
 			}
 
-			project, _, err := ws.ReadProject()
+			cwd, err := os.Getwd()
+			if err != nil {
+				return fmt.Errorf("getting current working directory: %w", err)
+			}
+
+			project, _, err := ws.ReadProject(cwd)
 			if err != nil {
 				return err
 			}
@@ -377,6 +413,7 @@ func newConfigRmCmd(ws pkgWorkspace.Context, stack *string) *cobra.Command {
 				*stack,
 				cmdStack.OfferNew|cmdStack.SetCurrent,
 				opts,
+				*configFile,
 			)
 			if err != nil {
 				return err
@@ -387,7 +424,7 @@ func newConfigRmCmd(ws pkgWorkspace.Context, stack *string) *cobra.Command {
 				return fmt.Errorf("invalid configuration key: %w", err)
 			}
 
-			ps, err := cmdStack.LoadProjectStack(ctx, cmdutil.Diag(), project, stack)
+			ps, err := cmdStack.LoadProjectStack(ctx, cmdutil.Diag(), project, stack, *configFile)
 			if err != nil {
 				return err
 			}
@@ -406,7 +443,7 @@ func newConfigRmCmd(ws pkgWorkspace.Context, stack *string) *cobra.Command {
 				return err
 			}
 
-			return cmdStack.SaveProjectStack(ctx, stack, ps)
+			return cmdStack.SaveProjectStack(ctx, stack, ps, *configFile)
 		},
 	}
 	constrictor.AttachArguments(rmCmd, &constrictor.Arguments{
@@ -418,17 +455,19 @@ func newConfigRmCmd(ws pkgWorkspace.Context, stack *string) *cobra.Command {
 
 	rmCmd.PersistentFlags().BoolVar(
 		&path, "path", false,
-		"The key contains a path to a property in a map or list to remove")
+		"The key contains a path to a property in a map or list to remove",
+	)
 
 	return rmCmd
 }
 
-func newConfigRmAllCmd(ws pkgWorkspace.Context, stack *string) *cobra.Command {
+func newConfigRemoveAllCmd(ws pkgWorkspace.Context, stack *string, configFile *string) *cobra.Command {
 	var path bool
 
 	rmAllCmd := &cobra.Command{
-		Use:   "rm-all",
-		Short: "Remove multiple configuration values",
+		Use:     "remove-all",
+		Aliases: []string{"rm-all", "delete-all"},
+		Short:   "Remove multiple configuration values",
 		Long: "Remove multiple configuration values.\n\n" +
 			"The `--path` flag indicates that keys should be parsed within maps or lists:\n\n" +
 			"  - `pulumi config rm-all --path  outer.inner 'foo[0]' key1` will remove the \n" +
@@ -441,7 +480,12 @@ func newConfigRmAllCmd(ws pkgWorkspace.Context, stack *string) *cobra.Command {
 				Color: cmdutil.GetGlobalColorization(),
 			}
 
-			project, _, err := ws.ReadProject()
+			cwd, err := os.Getwd()
+			if err != nil {
+				return fmt.Errorf("getting current working directory: %w", err)
+			}
+
+			project, _, err := ws.ReadProject(cwd)
 			if err != nil {
 				return err
 			}
@@ -454,12 +498,13 @@ func newConfigRmAllCmd(ws pkgWorkspace.Context, stack *string) *cobra.Command {
 				*stack,
 				cmdStack.OfferNew,
 				opts,
+				*configFile,
 			)
 			if err != nil {
 				return err
 			}
 
-			ps, err := cmdStack.LoadProjectStack(ctx, cmdutil.Diag(), project, stack)
+			ps, err := cmdStack.LoadProjectStack(ctx, cmdutil.Diag(), project, stack, *configFile)
 			if err != nil {
 				return err
 			}
@@ -485,7 +530,7 @@ func newConfigRmAllCmd(ws pkgWorkspace.Context, stack *string) *cobra.Command {
 				}
 			}
 
-			return cmdStack.SaveProjectStack(ctx, stack, ps)
+			return cmdStack.SaveProjectStack(ctx, stack, ps, *configFile)
 		},
 	}
 	constrictor.AttachArguments(rmAllCmd, &constrictor.Arguments{
@@ -498,12 +543,15 @@ func newConfigRmAllCmd(ws pkgWorkspace.Context, stack *string) *cobra.Command {
 
 	rmAllCmd.PersistentFlags().BoolVar(
 		&path, "path", false,
-		"Parse the keys as paths in a map or list rather than raw strings")
+		"Parse the keys as paths in a map or list rather than raw strings",
+	)
 
 	return rmAllCmd
 }
 
-func newConfigRefreshCmd(ws pkgWorkspace.Context, stk *string, lm cmdBackend.LoginManager) *cobra.Command {
+func newConfigRefreshCmd(
+	ws pkgWorkspace.Context, stk *string, lm cmdBackend.LoginManager, configFile *string,
+) *cobra.Command {
 	var force bool
 	refreshCmd := &cobra.Command{
 		Use:   "refresh",
@@ -514,7 +562,12 @@ func newConfigRefreshCmd(ws pkgWorkspace.Context, stk *string, lm cmdBackend.Log
 				Color: cmdutil.GetGlobalColorization(),
 			}
 
-			project, _, err := ws.ReadProject()
+			cwd, err := os.Getwd()
+			if err != nil {
+				return fmt.Errorf("getting current working directory: %w", err)
+			}
+
+			project, _, err := ws.ReadProject(cwd)
 			if err != nil {
 				return err
 			}
@@ -528,14 +581,15 @@ func newConfigRefreshCmd(ws pkgWorkspace.Context, stk *string, lm cmdBackend.Log
 				*stk,
 				cmdStack.LoadOnly,
 				opts,
+				*configFile,
 			)
 			if err != nil {
 				return err
 			}
 
 			var configPath string
-			if cmdStack.ConfigFile != "" {
-				configPath = cmdStack.ConfigFile
+			if *configFile != "" {
+				configPath = *configFile
 			} else if s.ConfigLocation().IsRemote {
 				// TODO: This should be possible in the future to reset the remote config back to previous used config.
 				// See: https://github.com/pulumi/pulumi/issues/19557
@@ -553,7 +607,7 @@ func newConfigRefreshCmd(ws pkgWorkspace.Context, stk *string, lm cmdBackend.Log
 				return fmt.Errorf("getting latest configuration: %w", err)
 			}
 
-			ps, err := cmdStack.LoadProjectStack(ctx, cmdutil.Diag(), project, s)
+			ps, err := cmdStack.LoadProjectStack(ctx, cmdutil.Diag(), project, s, *configFile)
 			if err != nil {
 				return err
 			}
@@ -633,22 +687,26 @@ func newConfigRefreshCmd(ws pkgWorkspace.Context, stk *string, lm cmdBackend.Log
 	constrictor.AttachArguments(refreshCmd, constrictor.NoArgs)
 
 	refreshCmd.PersistentFlags().BoolVarP(
-		&force, "force", "f", false, "Overwrite configuration file, if it exists, without creating a backup")
+		&force, "force", "f", false, "Overwrite configuration file, if it exists, without creating a backup",
+	)
 
 	return refreshCmd
 }
 
 type configSetCmd struct {
 	Stdin            *os.File
-	LoadProjectStack func(context.Context, diag.Sink, *workspace.Project, backend.Stack) (*workspace.ProjectStack, error)
+	LoadProjectStack func(
+		context.Context, diag.Sink, *workspace.Project, backend.Stack, string,
+	) (*workspace.ProjectStack, error)
 
 	Plaintext bool
 	Secret    bool
 	Path      bool
+	Raw       bool
 	Type      string
 }
 
-func newConfigSetCmd(ws pkgWorkspace.Context, stack *string) *cobra.Command {
+func newConfigSetCmd(ws pkgWorkspace.Context, stack *string, configFile *string) *cobra.Command {
 	configSetCmd := &configSetCmd{LoadProjectStack: cmdStack.LoadProjectStack}
 
 	setCmd := &cobra.Command{
@@ -656,7 +714,8 @@ func newConfigSetCmd(ws pkgWorkspace.Context, stack *string) *cobra.Command {
 		Short: "Set configuration value",
 		Long: "Configuration values can be accessed when a stack is being deployed and used to configure behavior. \n" +
 			"If a value is not present on the command line, pulumi will prompt for the value. Multi-line values\n" +
-			"may be set by piping a file to standard in.\n\n" +
+			"may be set by piping a file to standard in. Note that in that case, trailing newlines are stripped,\n" +
+			"unless `--raw` is passed.\n\n" +
 			"The `--path` flag can be used to set a value inside a map or list:\n\n" +
 			"  - `pulumi config set --path 'names[0]' a` " +
 			"will set the value to a list with the first item `a`.\n" +
@@ -673,7 +732,12 @@ func newConfigSetCmd(ws pkgWorkspace.Context, stack *string) *cobra.Command {
 				Color: cmdutil.GetGlobalColorization(),
 			}
 
-			project, _, err := ws.ReadProject()
+			cwd, err := os.Getwd()
+			if err != nil {
+				return fmt.Errorf("getting current working directory: %w", err)
+			}
+
+			project, _, err := ws.ReadProject(cwd)
 			if err != nil {
 				return err
 			}
@@ -687,12 +751,13 @@ func newConfigSetCmd(ws pkgWorkspace.Context, stack *string) *cobra.Command {
 				*stack,
 				cmdStack.OfferNew|cmdStack.SetCurrent,
 				opts,
+				*configFile,
 			)
 			if err != nil {
 				return err
 			}
 
-			return configSetCmd.Run(ctx, ws, args, project, s)
+			return configSetCmd.Run(ctx, ws, args, project, s, *configFile)
 		},
 	}
 
@@ -708,16 +773,24 @@ func newConfigSetCmd(ws pkgWorkspace.Context, stack *string) *cobra.Command {
 
 	setCmd.PersistentFlags().BoolVar(
 		&configSetCmd.Path, "path", false,
-		"The key contains a path to a property in a map or list to set")
+		"The key contains a path to a property in a map or list to set",
+	)
 	setCmd.PersistentFlags().BoolVar(
 		&configSetCmd.Plaintext, "plaintext", false,
-		"Save the value as plaintext (unencrypted)")
+		"Save the value as plaintext (unencrypted)",
+	)
 	setCmd.PersistentFlags().BoolVar(
 		&configSetCmd.Secret, "secret", false,
-		"Encrypt the value instead of storing it in plaintext")
+		"Encrypt the value instead of storing it in plaintext",
+	)
 	setCmd.PersistentFlags().StringVar(
-		&configSetCmd.Type, "type", "", "Save the value as the given type.  Allowed values are string, bool, int, and float")
+		&configSetCmd.Type, "type", "", "Save the value as the given type.  Allowed values are string, bool, int, and float",
+	)
 	setCmd.MarkFlagsMutuallyExclusive("secret", "plaintext", "type")
+	setCmd.PersistentFlags().BoolVar(
+		&configSetCmd.Raw, "raw", false,
+		"When setting the value through stdin, do not trim trailing newlines from the value",
+	)
 	setCmd.DisableFlagsInUseLine = true
 
 	return setCmd
@@ -725,6 +798,7 @@ func newConfigSetCmd(ws pkgWorkspace.Context, stack *string) *cobra.Command {
 
 func (c *configSetCmd) Run(
 	ctx context.Context, ws pkgWorkspace.Context, args []string, project *workspace.Project, s backend.Stack,
+	configFile string,
 ) error {
 	stdin := c.Stdin
 	if stdin == nil {
@@ -745,7 +819,11 @@ func (c *configSetCmd) Run(
 		if readerr != nil {
 			return readerr
 		}
-		value = cmdutil.RemoveTrailingNewline(string(b))
+		if !c.Raw {
+			value = cmdutil.RemoveTrailingNewline(string(b))
+		} else {
+			value = string(b)
+		}
 	case !cmdutil.Interactive():
 		return backenderr.NonInteractiveInputRequiredError{Detail: "config value must be specified in non-interactive mode"}
 	case c.Secret:
@@ -760,7 +838,7 @@ func (c *configSetCmd) Run(
 		}
 	}
 
-	ps, err := c.LoadProjectStack(ctx, cmdutil.Diag(), project, s)
+	ps, err := c.LoadProjectStack(ctx, cmdutil.Diag(), project, s, configFile)
 	if err != nil {
 		return err
 	}
@@ -825,11 +903,11 @@ func (c *configSetCmd) Run(
 		return fmt.Errorf("could not set config: %w", err)
 	}
 
-	return cmdStack.SaveProjectStack(ctx, s, ps)
+	return cmdStack.SaveProjectStack(ctx, s, ps, configFile)
 }
 
 func newConfigSetAllCmd(
-	ws pkgWorkspace.Context, stack *string, lm cmdBackend.LoginManager, ssml encrypterFactory,
+	ws pkgWorkspace.Context, stack *string, lm cmdBackend.LoginManager, ssml encrypterFactory, configFile *string,
 ) *cobra.Command {
 	var plaintextArgs []string
 	var secretArgs []string
@@ -866,7 +944,12 @@ func newConfigSetAllCmd(
 				Color: cmdutil.GetGlobalColorization(),
 			}
 
-			project, _, err := ws.ReadProject()
+			cwd, err := os.Getwd()
+			if err != nil {
+				return fmt.Errorf("getting current working directory: %w", err)
+			}
+
+			project, _, err := ws.ReadProject(cwd)
 			if err != nil {
 				return err
 			}
@@ -880,12 +963,13 @@ func newConfigSetAllCmd(
 				*stack,
 				cmdStack.OfferNew,
 				opts,
+				*configFile,
 			)
 			if err != nil {
 				return err
 			}
 
-			ps, err := cmdStack.LoadProjectStack(ctx, cmdutil.Diag(), project, stack)
+			ps, err := cmdStack.LoadProjectStack(ctx, cmdutil.Diag(), project, stack, *configFile)
 			if err != nil {
 				return err
 			}
@@ -997,7 +1081,7 @@ func newConfigSetAllCmd(
 				}
 			}
 
-			return cmdStack.SaveProjectStack(ctx, stack, ps)
+			return cmdStack.SaveProjectStack(ctx, stack, ps, *configFile)
 		},
 	}
 
@@ -1005,13 +1089,16 @@ func newConfigSetAllCmd(
 
 	setCmd.PersistentFlags().BoolVar(
 		&path, "path", false,
-		"Parse the keys as paths in a map or list rather than raw strings")
+		"Parse the keys as paths in a map or list rather than raw strings",
+	)
 	setCmd.PersistentFlags().StringArrayVar(
 		&plaintextArgs, "plaintext", []string{},
-		"Marks a value as plaintext (unencrypted)")
+		"Marks a value as plaintext (unencrypted)",
+	)
 	setCmd.PersistentFlags().StringArrayVar(
 		&secretArgs, "secret", []string{},
-		"Marks a value as secret to be encrypted")
+		"Marks a value as secret to be encrypted",
+	)
 	setCmd.PersistentFlags().StringVar(
 		&jsonArg, "json", "",
 		"Read values from a JSON string in the format produced by 'pulumi config --json'",
@@ -1040,12 +1127,13 @@ func listConfig(
 	showSecrets bool,
 	jsonOut bool,
 	openEnvironment bool,
+	configFile string,
 ) error {
 	var env *esc.Environment
 	var diags []apitype.EnvironmentDiagnostic
 	var err error
 	if openEnvironment {
-		env, diags, err = openStackEnv(ctx, stack, ps)
+		env, diags, err = openStackEnv(ctx, stack, ps, nil)
 	} else {
 		env, diags, err = checkStackEnv(ctx, stack, ps)
 	}
@@ -1066,7 +1154,7 @@ func listConfig(
 		}
 		// This may have setup the stack's secrets provider, so save the stack if needed.
 		if state != cmdStack.SecretsManagerUnchanged {
-			if err = cmdStack.SaveProjectStack(ctx, stack, ps); err != nil {
+			if err = cmdStack.SaveProjectStack(ctx, stack, ps, configFile); err != nil {
 				return fmt.Errorf("save stack config: %w", err)
 			}
 		}
@@ -1084,7 +1172,7 @@ func listConfig(
 
 	// when listing configuration values
 	// also show values coming from the project and environment
-	err = workspace.ApplyProjectConfig(ctx, stackName, project, pulumiEnv, cfg, envCrypter)
+	err = pkgWorkspace.ApplyProjectConfig(ctx, stackName, project, pulumiEnv, cfg, envCrypter, nil)
 	if err != nil {
 		return err
 	}
@@ -1099,7 +1187,7 @@ func listConfig(
 			}
 			// This may have setup the stack's secrets provider, so save the stack if needed.
 			if state != cmdStack.SecretsManagerUnchanged {
-				if err = cmdStack.SaveProjectStack(ctx, stack, ps); err != nil {
+				if err = cmdStack.SaveProjectStack(ctx, stack, ps, configFile); err != nil {
 					return fmt.Errorf("save stack config: %w", err)
 				}
 			}
@@ -1214,12 +1302,18 @@ func getConfig(
 	key config.Key,
 	path, jsonOut,
 	openEnvironment bool,
+	configFile string,
 ) error {
-	project, _, err := ws.ReadProject()
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("getting current working directory: %w", err)
+	}
+
+	project, _, err := ws.ReadProject(cwd)
 	if err != nil {
 		return err
 	}
-	ps, err := cmdStack.LoadProjectStack(ctx, sink, project, stack)
+	ps, err := cmdStack.LoadProjectStack(ctx, sink, project, stack, configFile)
 	if err != nil {
 		return err
 	}
@@ -1227,7 +1321,7 @@ func getConfig(
 	var env *esc.Environment
 	var diags []apitype.EnvironmentDiagnostic
 	if openEnvironment {
-		env, diags, err = openStackEnv(ctx, stack, ps)
+		env, diags, err = openStackEnv(ctx, stack, ps, nil)
 	} else {
 		env, diags, err = checkStackEnv(ctx, stack, ps)
 	}
@@ -1247,7 +1341,7 @@ func getConfig(
 		}
 		// This may have setup the stack's secrets provider, so save the stack if needed.
 		if state != cmdStack.SecretsManagerUnchanged {
-			if err = cmdStack.SaveProjectStack(ctx, stack, ps); err != nil {
+			if err = cmdStack.SaveProjectStack(ctx, stack, ps, configFile); err != nil {
 				return fmt.Errorf("save stack config: %w", err)
 			}
 		}
@@ -1264,7 +1358,7 @@ func getConfig(
 	}
 
 	// when asking for a configuration value, include values from the project and environment
-	err = workspace.ApplyProjectConfig(ctx, stackName, project, pulumiEnv, cfg, envCrypter)
+	err = pkgWorkspace.ApplyProjectConfig(ctx, stackName, project, pulumiEnv, cfg, envCrypter, nil)
 	if err != nil {
 		return err
 	}
@@ -1283,7 +1377,7 @@ func getConfig(
 				}
 				// This may have setup the stack's secrets provider, so save the stack if needed.
 				if state != cmdStack.SecretsManagerUnchanged {
-					if err = cmdStack.SaveProjectStack(ctx, stack, ps); err != nil {
+					if err = cmdStack.SaveProjectStack(ctx, stack, ps, configFile); err != nil {
 						return fmt.Errorf("save stack config: %w", err)
 					}
 				}
@@ -1378,7 +1472,7 @@ func checkStackEnv(
 
 	envs, ok := stack.Backend().(backend.EnvironmentsBackend)
 	if !ok {
-		return nil, nil, fmt.Errorf("backend %v does not support environments", stack.Backend().Name())
+		return nil, nil, errBackendNoEnvironments(stack.Backend())
 	}
 	orgNamer, ok := stack.(interface{ OrgName() string })
 	if !ok {

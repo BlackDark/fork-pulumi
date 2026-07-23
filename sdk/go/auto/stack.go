@@ -101,6 +101,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -795,6 +796,11 @@ func refreshOptsToCmd(o *optrefresh.Options, s *Stack, isPreview bool) ([]string
 	if o.ClearPendingCreates {
 		args = append(args, "--clear-pending-creates")
 	}
+	// Each --import-pending-creates invocation accepts exactly one value, and the URN must be
+	// immediately followed by its provider ID, so we emit two flags per pending create.
+	for _, pc := range o.ImportPendingCreates {
+		args = append(args, "--import-pending-creates="+pc.URN, "--import-pending-creates="+pc.ID)
+	}
 	for _, tURN := range o.Target {
 		args = append(args, "--target="+tURN)
 	}
@@ -1373,9 +1379,7 @@ func (s *Stack) cliBaseOptions() base.BaseOptions {
 	if home := s.Workspace().PulumiHome(); home != "" {
 		env[pulumiHomeEnv] = home
 	}
-	for k, v := range s.Workspace().GetEnvVars() {
-		env[k] = v
-	}
+	maps.Copy(env, s.Workspace().GetEnvVars())
 	return base.BaseOptions{
 		Cwd:           s.Workspace().WorkDir(),
 		AdditionalEnv: env,

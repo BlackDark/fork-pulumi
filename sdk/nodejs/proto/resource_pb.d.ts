@@ -148,6 +148,8 @@ export class ReadResourceRequest extends jspb.Message {
     setParentstacktracehandle(value: string): ReadResourceRequest;
     getPackageref(): string;
     setPackageref(value: string): ReadResourceRequest;
+    getAcceptsByteString(): boolean;
+    setAcceptsByteString(value: boolean): ReadResourceRequest;
 
     serializeBinary(): Uint8Array;
     toObject(includeInstance?: boolean): ReadResourceRequest.AsObject;
@@ -179,6 +181,7 @@ export namespace ReadResourceRequest {
         stacktrace?: pulumi_source_pb.StackTrace.AsObject,
         parentstacktracehandle: string,
         packageref: string,
+        acceptsByteString: boolean,
     }
 }
 
@@ -335,6 +338,10 @@ export class RegisterResourceRequest extends jspb.Message {
 
     getEnvvarmappingsMap(): jspb.Map<string, string>;
     clearEnvvarmappingsMap(): void;
+    getSnippetid(): string;
+    setSnippetid(value: string): RegisterResourceRequest;
+    getAcceptsByteString(): boolean;
+    setAcceptsByteString(value: boolean): RegisterResourceRequest;
 
     serializeBinary(): Uint8Array;
     toObject(includeInstance?: boolean): RegisterResourceRequest.AsObject;
@@ -392,6 +399,8 @@ export namespace RegisterResourceRequest {
         hidediffsList: Array<string>,
 
         envvarmappingsMap: Array<[string, string]>,
+        snippetid: string,
+        acceptsByteString: boolean,
     }
 
 
@@ -424,6 +433,8 @@ export namespace RegisterResourceRequest {
         setUpdate(value: string): CustomTimeouts;
         getDelete(): string;
         setDelete(value: string): CustomTimeouts;
+        getRead(): string;
+        setRead(value: string): CustomTimeouts;
 
         serializeBinary(): Uint8Array;
         toObject(includeInstance?: boolean): CustomTimeouts.AsObject;
@@ -440,6 +451,7 @@ export namespace RegisterResourceRequest {
             create: string,
             update: string,
             pb_delete: string,
+            read: string,
         }
     }
 
@@ -625,6 +637,8 @@ export class ResourceInvokeRequest extends jspb.Message {
     setParentstacktracehandle(value: string): ResourceInvokeRequest;
     getPackageref(): string;
     setPackageref(value: string): ResourceInvokeRequest;
+    getAcceptsByteString(): boolean;
+    setAcceptsByteString(value: boolean): ResourceInvokeRequest;
 
     serializeBinary(): Uint8Array;
     toObject(includeInstance?: boolean): ResourceInvokeRequest.AsObject;
@@ -650,6 +664,7 @@ export namespace ResourceInvokeRequest {
         stacktrace?: pulumi_source_pb.StackTrace.AsObject,
         parentstacktracehandle: string,
         packageref: string,
+        acceptsByteString: boolean,
     }
 }
 
@@ -687,6 +702,8 @@ export class ResourceCallRequest extends jspb.Message {
     setParentstacktracehandle(value: string): ResourceCallRequest;
     getPackageref(): string;
     setPackageref(value: string): ResourceCallRequest;
+    getAcceptsByteString(): boolean;
+    setAcceptsByteString(value: boolean): ResourceCallRequest;
 
     serializeBinary(): Uint8Array;
     toObject(includeInstance?: boolean): ResourceCallRequest.AsObject;
@@ -713,6 +730,7 @@ export namespace ResourceCallRequest {
         stacktrace?: pulumi_source_pb.StackTrace.AsObject,
         parentstacktracehandle: string,
         packageref: string,
+        acceptsByteString: boolean,
     }
 
 
@@ -1322,6 +1340,11 @@ export class RegisterPackageRequest extends jspb.Message {
     getParameterization(): Parameterization | undefined;
     setParameterization(value?: Parameterization): RegisterPackageRequest;
 
+    hasExtension$(): boolean;
+    clearExtension$(): void;
+    getExtension$(): Parameterization | undefined;
+    setExtension$(value?: Parameterization): RegisterPackageRequest;
+
     serializeBinary(): Uint8Array;
     toObject(includeInstance?: boolean): RegisterPackageRequest.AsObject;
     static toObject(includeInstance: boolean, msg: RegisterPackageRequest): RegisterPackageRequest.AsObject;
@@ -1340,6 +1363,7 @@ export namespace RegisterPackageRequest {
 
         checksumsMap: Array<[string, Uint8Array | string]>,
         parameterization?: Parameterization.AsObject,
+        extension?: Parameterization.AsObject,
     }
 }
 
@@ -1463,6 +1487,7 @@ export enum ResourceMonitorFeature {
     RESOURCE_MONITOR_FEATURE_RESOURCE_HOOKS = 10,
     RESOURCE_MONITOR_FEATURE_ERROR_HOOKS = 11,
     RESOURCE_MONITOR_FEATURE_SENDS_OPTIONS_TO_HOOKS = 12,
+    RESOURCE_MONITOR_FEATURE_BYTE_STRING = 13,
 }
 
 export enum Result {

@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"io"
 	"iter"
+	"maps"
 	"math/bits"
 	"net/http"
 	"net/url"
@@ -41,14 +42,14 @@ import (
 	"go.opentelemetry.io/otel"
 
 	"github.com/pulumi/pulumi/pkg/v3/engine"
+	"github.com/pulumi/pulumi/pkg/v3/registry"
+	"github.com/pulumi/pulumi/pkg/v3/resource/plugin"
 	"github.com/pulumi/pulumi/pkg/v3/util/validation"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag/colors"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/env"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/registry"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/agentdetect"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/cmdutil"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
@@ -56,8 +57,11 @@ import (
 )
 
 const (
-	// 20s before we give up on a copilot request
+	// 20s before we give up on a warm, interactive Neo request.
 	NeoRequestTimeout = 20 * time.Second
+	// Task creation can trigger a backend cold start (up to ~1 min after a new
+	// Neo version is deployed), so allow it a much longer budget than warm requests.
+	NeoCreateTaskTimeout = 120 * time.Second
 )
 
 // NeoApprovalMode controls whether the agent requires user approval before executing tools.
@@ -121,6 +125,10 @@ type NeoTaskRequest struct {
 	// NeoTaskSourceCLI; the server validates against apitype.AgentTaskSource and defaults
 	// to "api" if omitted.
 	Source NeoTaskSource `json:"source,omitempty"`
+	// EnabledIntegrations is a three-state pointer matching apitype.CreateAgentTaskRequest:
+	// nil inherits all org-enabled integrations, a non-nil empty slice sends `[]` to opt out
+	// of every integration, and a populated slice allow-lists specific ones.
+	EnabledIntegrations *[]string `json:"enabledIntegrations,omitempty"`
 }
 
 // NeoTaskMessage represents the message content for a Neo task.
@@ -143,6 +151,7 @@ type AgentSignupChallenge struct {
 type AgentSignupResponse struct {
 	AccessToken           string    `json:"accessToken"`
 	AccessTokenValidUntil time.Time `json:"accessTokenValidUntil"`
+	RefreshToken          string    `json:"refreshToken,omitempty"`
 	ClaimToken            string    `json:"claimToken"`
 	ClaimTokenValidUntil  time.Time `json:"claimTokenValidUntil"`
 }
@@ -174,6 +183,14 @@ type NeoTaskEntity struct {
 // NeoTaskResponse represents the response from creating a Neo task.
 type NeoTaskResponse struct {
 	TaskID string `json:"taskId"`
+}
+
+// NeoTask represents the fields from an existing Neo task that the CLI needs
+// when reattaching to it.
+type NeoTask struct {
+	TaskID         string            `json:"taskId"`
+	ApprovalMode   NeoApprovalMode   `json:"approvalMode,omitempty"`
+	PermissionMode NeoPermissionMode `json:"permissionMode,omitempty"`
 }
 
 // TemplatePublishOperationID uniquely identifies a template publish operation.
@@ -212,7 +229,7 @@ type PublishTemplateVersionCompleteResponse struct{}
 // Client provides a slim wrapper around the Pulumi HTTP/REST API.
 type Client struct {
 	apiURL     string
-	apiToken   apiAccessToken
+	apiToken   accessToken
 	apiUser    string
 	apiOrgs    []string
 	tokenInfo  *workspace.TokenInformation // might be nil if running against old services
@@ -267,6 +284,39 @@ func (pc *Client) WithHTTPClient(httpClient *http.Client) *Client {
 		client: &defaultHTTPClient{
 			client: httpClient,
 		},
+	}
+	return pc
+}
+
+// WithRefresh wires an OAuth refresh token + a credentials-writeback callback into this client.
+// Once configured, the client transparently exchanges the refresh token at /api/oauth/token for a
+// fresh access token whenever the service rejects the current one with 401, retrying the original
+// request before falling through to LoginRequiredError. Passing an empty refresh token is a no-op
+// so callers can guard on workspace.Account.RefreshToken without a separate branch.
+func (pc *Client) WithRefresh(
+	refreshToken string,
+	writeback func(accessToken string, accessTokenExpiresAt time.Time, refreshToken string) error,
+) *Client {
+	if refreshToken == "" {
+		return pc
+	}
+	contract.Requiref(writeback != nil, "writeback", "must not be nil when refreshToken is non-empty")
+	initial, _ := pc.apiToken.Get(context.Background())
+	pc.apiToken = &refreshableAPIAccessToken{
+		accessToken:  initial,
+		refreshToken: refreshToken,
+		refresh: func(ctx context.Context, rt string) (string, time.Time, string, error) {
+			resp, err := pc.RefreshAccessToken(ctx, rt)
+			if err != nil {
+				return "", time.Time{}, "", err
+			}
+			var expiresAt time.Time
+			if resp.ExpiresIn > 0 {
+				expiresAt = time.Now().Add(time.Duration(resp.ExpiresIn) * time.Second)
+			}
+			return resp.AccessToken, expiresAt, resp.RefreshToken, nil
+		},
+		writeback: writeback,
 	}
 	return pc
 }
@@ -599,6 +649,56 @@ func (pc *Client) ExchangeOidcToken(
 	err = json.Unmarshal(body, &unmarshalledResp)
 	if err != nil {
 		return nil, err
+	}
+	return &unmarshalledResp, nil
+}
+
+// RefreshAccessToken exchanges a Pulumi-issued refresh token for a fresh access token via
+// /api/oauth/token (grant_type=refresh_token, RFC 6749 §6). Returns the parsed token response;
+// the response's RefreshToken is the value to use on subsequent calls (the server may or may
+// not rotate it). The caller is responsible for writing the response's AccessToken back into
+// credentials.json when the exchange succeeds.
+func (pc *Client) RefreshAccessToken(
+	ctx context.Context,
+	refreshToken string,
+) (*apitype.TokenExchangeGrantResponse, error) {
+	if refreshToken == "" {
+		return nil, errors.New("refresh token is required")
+	}
+	tokenURL := pc.apiURL + "/api/oauth/token"
+	data := url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {refreshToken},
+	}
+	bodyReader := strings.NewReader(data.Encode())
+
+	req, err := http.NewRequestWithContext(ctx, "POST", tokenURL, bodyReader)
+	if err != nil {
+		return nil, fmt.Errorf("creating HTTP request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := pc.restClient.HTTPClient().Do(req, retryAllMethods)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		// Forward the server's RFC 6749 §5.2 error payload as the error message so callers can
+		// distinguish invalid_grant (token gone / revoked / wrong type) from unsupported_grant_type
+		// (LD kill switch flipped) and react accordingly.
+		return nil, fmt.Errorf("refresh_token grant failed: %s: %s", resp.Status, string(body))
+	}
+	var unmarshalledResp apitype.TokenExchangeGrantResponse
+	if err := json.Unmarshal(body, &unmarshalledResp); err != nil {
+		return nil, err
+	}
+	if unmarshalledResp.AccessToken == "" {
+		return nil, errors.New("refresh_token grant returned empty access_token")
 	}
 	return &unmarshalledResp, nil
 }
@@ -1325,6 +1425,22 @@ func (pc *Client) GetStackUpdates(
 		}
 		path += fmt.Sprintf("?pageSize=%d&page=%d", pageSize, page)
 	}
+	if err := pc.restCall(ctx, "GET", path, nil, nil, &response); err != nil {
+		return nil, err
+	}
+
+	return response.Updates, nil
+}
+
+// GetLatestStackPreviews returns the stack's most recent preview operations, newest-first.
+// Previews are tracked separately from update history (see GetStackUpdates).
+func (pc *Client) GetLatestStackPreviews(
+	ctx context.Context,
+	stack StackIdentifier,
+) ([]apitype.StackPreview, error) {
+	var response apitype.GetLatestStackPreviewsResponse
+	// asc=false requests newest-first; the endpoint otherwise defaults to oldest-first.
+	path := getStackPath(stack, "updates", "latest", "previews") + "?asc=false&pageSize=1&page=1"
 	if err := pc.restCall(ctx, "GET", path, nil, nil, &response); err != nil {
 		return nil, err
 	}
@@ -2364,12 +2480,6 @@ func (pc *Client) UpdateStackConfig(
 	return pc.restCall(ctx, "PUT", getStackPath(stack, "config"), nil, config, nil)
 }
 
-func (pc *Client) UpdateStackDeploymentSettings(ctx context.Context, stack StackIdentifier,
-	deployment apitype.DeploymentSettings,
-) error {
-	return pc.restCall(ctx, "PUT", getStackPath(stack, "deployments", "settings"), nil, deployment, nil)
-}
-
 // PatchStackDeploymentSettings merges the supplied patch into the stack's
 // existing deployment settings. Wraps the `PatchDeploymentSettings` Pulumi
 // Cloud REST endpoint (POST /api/stacks/{org}/{project}/{stack}/deployments/settings).
@@ -2383,19 +2493,6 @@ func (pc *Client) PatchStackDeploymentSettings(ctx context.Context, stack StackI
 	patch json.RawMessage,
 ) error {
 	return pc.restCall(ctx, http.MethodPost, getStackPath(stack, "deployments", "settings"), nil, patch, nil)
-}
-
-func (pc *Client) EncryptStackDeploymentSettingsSecret(ctx context.Context,
-	stack StackIdentifier, secret string,
-) (*apitype.SecretValue, error) {
-	request := apitype.SecretValue{Value: secret}
-	response := apitype.SecretValue{}
-	err := pc.restCall(ctx, "POST", getStackPath(stack, "deployments", "settings", "encrypt"), nil, &request, &response)
-	if err != nil {
-		return nil, err
-	}
-
-	return &response, nil
 }
 
 func (pc *Client) DestroyStackDeploymentSettings(ctx context.Context, stack StackIdentifier) error {
@@ -2647,10 +2744,11 @@ func (pc *Client) ExplainPreviewWithNeo(
 // CreateNeoTaskOptions bundles the optional knobs on CreateNeoTask. The zero value
 // accepts the server-side defaults for every field.
 type CreateNeoTaskOptions struct {
-	ToolExecutionMode string
-	ApprovalMode      NeoApprovalMode
-	PermissionMode    NeoPermissionMode
-	PlanMode          bool
+	ToolExecutionMode   string
+	ApprovalMode        NeoApprovalMode
+	PermissionMode      NeoPermissionMode
+	PlanMode            bool
+	EnabledIntegrations *[]string
 }
 
 // CreateNeoTask creates a new Neo agent task via the Neo Tasks API. See
@@ -2663,7 +2761,7 @@ func (pc *Client) CreateNeoTask(
 	projectName string,
 	opts CreateNeoTaskOptions,
 ) (*NeoTaskResponse, error) {
-	ctx, cancel := context.WithTimeout(ctx, NeoRequestTimeout)
+	ctx, cancel := context.WithTimeout(ctx, NeoCreateTaskTimeout)
 	defer cancel()
 
 	request := NeoTaskRequest{
@@ -2672,11 +2770,12 @@ func (pc *Client) CreateNeoTask(
 			Content:   content,
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
 		},
-		ToolExecutionMode: opts.ToolExecutionMode,
-		ApprovalMode:      opts.ApprovalMode,
-		PermissionMode:    opts.PermissionMode,
-		PlanMode:          opts.PlanMode,
-		Source:            NeoTaskSourceCLI,
+		ToolExecutionMode:   opts.ToolExecutionMode,
+		ApprovalMode:        opts.ApprovalMode,
+		PermissionMode:      opts.PermissionMode,
+		PlanMode:            opts.PlanMode,
+		EnabledIntegrations: opts.EnabledIntegrations,
+		Source:              NeoTaskSourceCLI,
 	}
 	// Only attach a stack entity when we actually have one — the backend rejects
 	// entity_diff entries with empty name/project as "unable to access stack".
@@ -2722,22 +2821,77 @@ func (pc *Client) UpdateNeoTask(
 	return nil
 }
 
+// GetNeoTask fetches task metadata for an existing Neo task.
+func (pc *Client) GetNeoTask(ctx context.Context, orgName, taskID string) (*NeoTask, error) {
+	ctx, cancel := context.WithTimeout(ctx, NeoRequestTimeout)
+	defer cancel()
+
+	path := fmt.Sprintf("/api/preview/agents/%s/tasks/%s", orgName, taskID)
+	var resp NeoTask
+	if err := pc.restCall(ctx, http.MethodGet, path, nil, nil, &resp); err != nil {
+		return nil, fmt.Errorf("getting Neo task: %w", err)
+	}
+	return &resp, nil
+}
+
 // NeoStreamEvent is one item from a Neo task Server-Sent Events (SSE) stream. Exactly
-// one of Data or Err is populated: Data carries an event payload, Err carries a terminal
-// stream error (after which no further values are sent before the channel closes). ID
-// is the SSE `id:` field associated with the event (empty if absent); callers track it
-// to send `Last-Event-ID` on reconnect so the server can replay missed events.
+// one of Data, KeepAlive, or Err is populated: Data carries an event payload, KeepAlive
+// reports an SSE comment heartbeat, and Err carries a terminal stream error (after
+// which no further values are sent before the channel closes). ID is the SSE `id:`
+// field associated with the event (empty if absent); callers track it to send
+// `Last-Event-ID` on reconnect so the server can replay missed events.
 type NeoStreamEvent struct {
-	Data []byte
-	ID   string
-	Err  error
+	Data      []byte
+	ID        string
+	KeepAlive bool
+	Err       error
+}
+
+type neoTaskEventsResponse struct {
+	Events            []apitype.AgentConsoleEvent `json:"events"`
+	ContinuationToken *string                     `json:"continuationToken,omitempty"`
+}
+
+// GetNeoTaskEvents returns all currently recorded events for a Neo task and the
+// newest event ID. Callers can pass the returned ID to StreamNeoTaskEvents as
+// Last-Event-ID to attach from the live tail without replaying historical events.
+func (pc *Client) GetNeoTaskEvents(
+	ctx context.Context, orgName, taskID string,
+) ([]apitype.AgentConsoleEvent, string, error) {
+	ctx, cancel := context.WithTimeout(ctx, NeoRequestTimeout)
+	defer cancel()
+
+	var events []apitype.AgentConsoleEvent
+	var lastEventID string
+	var continuationToken string
+	for {
+		path := fmt.Sprintf("/api/preview/agents/%s/tasks/%s/events?pageSize=1000", orgName, taskID)
+		if continuationToken != "" {
+			path += "&continuationToken=" + url.QueryEscape(continuationToken)
+		}
+
+		var resp neoTaskEventsResponse
+		if err := pc.restCall(ctx, http.MethodGet, path, nil, nil, &resp); err != nil {
+			return nil, "", fmt.Errorf("getting Neo task events: %w", err)
+		}
+		for _, event := range resp.Events {
+			if event.ID != "" {
+				lastEventID = event.ID
+			}
+		}
+		events = append(events, resp.Events...)
+		if resp.ContinuationToken == nil || *resp.ContinuationToken == "" {
+			return events, lastEventID, nil
+		}
+		continuationToken = *resp.ContinuationToken
+	}
 }
 
 // StreamNeoTaskEvents opens a Server-Sent Events (SSE) connection to the Neo task event
 // stream and returns a channel of events. Each value carries either a raw event payload
 // (the bytes following each `data:` line, joined for multi-line events) along with the
-// `id:` of that event, or a terminal stream error. The channel is closed when the stream
-// ends or ctx is cancelled.
+// `id:` of that event, a keep-alive marker for SSE comments, or a terminal stream error.
+// The channel is closed when the stream ends or ctx is cancelled.
 //
 // If lastEventID is non-empty it is sent as the `Last-Event-ID` request header; the
 // pulumi-service stream endpoint honors this and replays only events with sequence
@@ -2756,7 +2910,11 @@ func (pc *Client) StreamNeoTaskEvents(
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("Cache-Control", "no-cache")
 	req.Header.Set("X-Pulumi-Source", "Pulumi CLI")
-	req.Header.Set("Authorization", "token "+string(pc.apiToken))
+	apiToken, err := pc.apiToken.Get(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("fetching credentials: %w", err)
+	}
+	req.Header.Set("Authorization", "token "+apiToken)
 	if lastEventID != "" {
 		req.Header.Set("Last-Event-ID", lastEventID)
 	}
@@ -2809,6 +2967,7 @@ func (pc *Client) StreamNeoTaskEvents(
 				continue
 			}
 			if strings.HasPrefix(line, ":") {
+				send(NeoStreamEvent{KeepAlive: true})
 				continue
 			}
 			if chunk, ok := strings.CutPrefix(line, "data:"); ok {
@@ -2863,7 +3022,10 @@ func (pc *Client) callCopilot(ctx context.Context, requestBody any) (string, err
 	defer cancel()
 
 	url := pc.apiURL + "/api/ai/chat/preview"
-	apiToken := string(pc.apiToken)
+	apiToken, err := pc.apiToken.Get(ctx)
+	if err != nil {
+		return "", fmt.Errorf("fetching credentials: %w", err)
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(jsonData))
 	if err != nil {
@@ -3253,9 +3415,7 @@ func (pc *Client) ListTemplates(
 			if continuationToken != nil {
 				// Clone so we don't mutate the captured map between iterations.
 				pageQuery = url.Values{}
-				for k, v := range query {
-					pageQuery[k] = v
-				}
+				maps.Copy(pageQuery, query)
 				pageQuery.Set("continuationToken", *continuationToken)
 			}
 			var resp apitype.ListTemplatesResponse
@@ -3565,4 +3725,18 @@ func (pc *Client) GetInsightsScanLogs(
 		return apitype.InsightsScanLogs{}, err
 	}
 	return resp, nil
+}
+
+// CreateLogEncryptionSession creates a new log encryption session via the
+// Pulumi Cloud API. The service generates a session key and returns it
+// along with a session ID that can be used to identify the key later.
+func (pc *Client) CreateLogEncryptionSession(
+	ctx context.Context,
+	req apitype.LogEncryptionSessionInitRequest,
+) (*apitype.LogEncryptionSessionInitResponse, error) {
+	var resp apitype.LogEncryptionSessionInitResponse
+	if err := pc.restCall(ctx, http.MethodPost, "/api/log-encryption-session/init", nil, req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
 }

@@ -21,8 +21,8 @@ import (
 	"strings"
 
 	"github.com/hashicorp/hcl/v2"
+	"github.com/pulumi/pulumi/pkg/v3/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/promise"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
@@ -71,11 +71,11 @@ func (p *languageRuntime) Close() error {
 
 func (p *languageRuntime) GetRequiredPackages(
 	ctx context.Context, info plugin.ProgramInfo,
-) ([]workspace.PackageDescriptor, error) {
+) ([]workspace.PackageDescriptor, []workspace.PackageSpec, error) {
 	if p.closed {
-		return nil, ErrLanguageRuntimeIsClosed
+		return nil, nil, ErrLanguageRuntimeIsClosed
 	}
-	return p.requiredPackages, nil
+	return p.requiredPackages, nil, nil
 }
 
 func (p *languageRuntime) Run(

@@ -25,6 +25,7 @@ import (
 	pkgWorkspace "github.com/pulumi/pulumi/pkg/v3/workspace"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/env"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/util/agentdetect"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -57,7 +58,7 @@ func TestGetCurrentCloudURLFallsBackToAgentCredentials(t *testing.T) {
 		},
 	}
 
-	url, err := getCurrentCloudURL(ws, nil)
+	url, err := pkgWorkspace.GetCurrentCloudURLWithAgentFallback(ws, env.Global(), nil)
 	require.NoError(t, err)
 	assert.Equal(t, "https://api.agent.example", url)
 }
@@ -75,7 +76,7 @@ func TestGetCurrentCloudURLReturnsEmptyAgentCurrent(t *testing.T) {
 		},
 	}
 
-	url, err := getCurrentCloudURL(ws, nil)
+	url, err := pkgWorkspace.GetCurrentCloudURLWithAgentFallback(ws, env.Global(), nil)
 	require.NoError(t, err)
 	assert.Empty(t, url)
 }
@@ -95,7 +96,7 @@ func TestGetCurrentCloudURLReturnsAgentCredentialReadError(t *testing.T) {
 		},
 	}
 
-	_, err := getCurrentCloudURL(ws, nil)
+	_, err := pkgWorkspace.GetCurrentCloudURLWithAgentFallback(ws, env.Global(), nil)
 	require.ErrorContains(t, err, "could not get cloud url from agent credentials")
 }
 
@@ -112,7 +113,7 @@ func TestGetCurrentCloudURLDoesNotFallbackWithExplicitPath(t *testing.T) {
 		},
 	}
 
-	_, err := getCurrentCloudURL(ws, nil)
+	_, err := pkgWorkspace.GetCurrentCloudURLWithAgentFallback(ws, env.Global(), nil)
 	require.ErrorIs(t, err, assert.AnError)
 }
 
@@ -127,7 +128,7 @@ func TestGetCurrentCloudURLReturnsDefaultCredentialErrorsOutsideAgents(t *testin
 		},
 	}
 
-	_, err := getCurrentCloudURL(ws, nil)
+	_, err := pkgWorkspace.GetCurrentCloudURLWithAgentFallback(ws, env.Global(), nil)
 	require.ErrorIs(t, err, assert.AnError)
 }
 
@@ -136,7 +137,7 @@ func TestGetCurrentCloudURLReturnsDefaultCloudURL(t *testing.T) {
 	clearAIAgentEnv(t)
 	t.Setenv(env.BackendURL.Var().Name(), "https://api.default-current.example.com")
 
-	url, err := getCurrentCloudURL(&pkgWorkspace.MockContext{}, nil)
+	url, err := pkgWorkspace.GetCurrentCloudURLWithAgentFallback(&pkgWorkspace.MockContext{}, env.Global(), nil)
 	require.NoError(t, err)
 	assert.Equal(t, "https://api.default-current.example.com", url)
 }
@@ -200,28 +201,7 @@ func clearAIAgentEnv(t *testing.T) {
 	t.Setenv(workspace.PulumiCredentialsPathEnvVar, "")
 	t.Setenv(env.Home.Var().Name(), "")
 
-	for _, name := range []string{
-		"AI_AGENT",
-		"CURSOR_TRACE_ID",
-		"CURSOR_AGENT",
-		"GEMINI_CLI",
-		"CODEX_SANDBOX",
-		"CODEX_CI",
-		"CODEX_THREAD_ID",
-		"ANTIGRAVITY_AGENT",
-		"AUGMENT_AGENT",
-		"OPENCODE",
-		"OPENCODE_CALLER",
-		"OPENCODE_CLIENT",
-		"CLAUDE_CODE_IS_COWORK",
-		"CLAUDECODE",
-		"CLAUDE_CODE",
-		"REPL_ID",
-		"COPILOT_MODEL",
-		"COPILOT_ALLOW_ALL",
-		"COPILOT_GITHUB_TOKEN",
-		"GOOSE_PROVIDER",
-	} {
+	for _, name := range agentdetect.DetectionEnvVars() {
 		t.Setenv(name, "")
 	}
 }

@@ -18,7 +18,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
+
+	pkgresource "github.com/pulumi/pulumi/pkg/v3/resource"
 
 	mapset "github.com/deckarep/golang-set/v2"
 
@@ -37,20 +40,19 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/engine"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
 	"github.com/pulumi/pulumi/pkg/v3/resource/graph"
+	"github.com/pulumi/pulumi/pkg/v3/resource/plugin"
 	pkgWorkspace "github.com/pulumi/pulumi/pkg/v3/workspace"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/env"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/cmdutil"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/util/logging"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/version"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 )
 
 func NewDestroyCmd() *cobra.Command {
 	var runProgram bool
+	var skipConfigValidation bool
 	var debug bool
 	var remove bool
 	var stackName string
@@ -59,6 +61,8 @@ func NewDestroyCmd() *cobra.Command {
 	var execKind string
 	var execAgent string
 	var configArray []string
+	var configFile string
+	var envOverrides []string
 	var path bool
 	var client string
 
@@ -178,7 +182,7 @@ func NewDestroyCmd() *cobra.Command {
 				err = deployment.ValidateUnsupportedRemoteFlags(false, nil, false, client, jsonDisplay, nil,
 					nil, refresh, showConfig, false, showReplacementSteps, showSames, false,
 					suppressOutputs, "default", targets, nil, nil, nil,
-					targetDependents, "", cmdStack.ConfigFile, runProgram)
+					targetDependents, "", configFile, runProgram)
 				if err != nil {
 					return err
 				}
@@ -216,19 +220,20 @@ func NewDestroyCmd() *cobra.Command {
 				stackName,
 				cmdStack.LoadOnly,
 				opts.Display,
+				configFile,
 			)
 			if err != nil {
 				return err
 			}
 
-			if err := parseAndSaveConfigArray(ctx, cmdutil.Diag(), ws, s, configArray, path); err != nil {
+			if err := parseAndSaveConfigArray(ctx, cmdutil.Diag(), ws, s, configArray, path, configFile); err != nil {
 				return err
 			}
 
 			proj, root, err := readProjectForUpdate(ws, client)
 			if err != nil && errors.Is(err, workspace.ErrProjectNotFound) {
-				logging.Warningf("failed to find current Pulumi project, continuing with an empty project"+
-					"using stack %v from backend %v", s.Ref().Name(), s.Backend().Name())
+				slog.WarnContext(ctx, "failed to find current Pulumi project, continuing with an empty project "+
+					"using stack from backend", "stack", s.Ref().Name(), "backend", s.Backend().Name())
 				projectName, has := s.Ref().Project()
 				if !has {
 					// If the stack doesn't have a project name (legacy diy) then leave this blank, as
@@ -253,7 +258,7 @@ func NewDestroyCmd() *cobra.Command {
 				// The config may be missing, fallback on the latest configuration in the backend.
 				getConfig = config.GetStackConfigurationOrLatest
 			}
-			cfg, sm, err := getConfig(ctx, cmdutil.Diag(), ssml, s, proj)
+			cfg, sm, err := getConfig(ctx, cmdutil.Diag(), ssml, s, proj, configFile, envOverrides)
 			if err != nil {
 				return fmt.Errorf("getting stack configuration: %w", err)
 			}
@@ -268,16 +273,30 @@ func NewDestroyCmd() *cobra.Command {
 			encrypter := sm.Encrypter()
 
 			stackName := s.Ref().Name().String()
-			configError := workspace.ValidateStackConfigAndApplyProjectConfig(
-				ctx,
-				stackName,
-				proj,
-				cfg.Environment,
-				cfg.Config,
-				encrypter,
-				decrypter)
-			if configError != nil {
-				return fmt.Errorf("validating stack config: %w", configError)
+			// Skip config validation when the program is not being run (the default for destroy),
+			// or when explicitly requested via --skip-config-validation. This allows stacks with
+			// missing or invalid config to be destroyed in scenarios such as ephemeral PR environments
+			// where config may diverge between branches.
+			if runProgram && !skipConfigValidation {
+				// Running the program: validate the stack config (and apply project defaults).
+				configError := pkgWorkspace.ValidateStackConfigAndApplyProjectConfig(
+					ctx,
+					stackName,
+					proj,
+					cfg.Environment,
+					cfg.Config,
+					encrypter,
+					decrypter)
+				if configError != nil {
+					return fmt.Errorf("validating stack config: %w", configError)
+				}
+			} else {
+				// The program isn't run, or validation was explicitly skipped: still apply
+				// project config defaults onto the stack config, but skip validation.
+				if configError := pkgWorkspace.ApplyProjectConfig(
+					ctx, stackName, proj, cfg.Environment, cfg.Config, encrypter, decrypter); configError != nil {
+					return fmt.Errorf("applying stack config: %w", configError)
+				}
 			}
 
 			refreshOption, err := getRefreshOption(proj, refresh)
@@ -395,6 +414,10 @@ func NewDestroyCmd() *cobra.Command {
 	cmd.PersistentFlags().BoolVar(
 		&runProgram, "run-program", env.RunProgram.Value(),
 		"Run the program to determine up-to-date state for providers to destroy resources")
+	cmd.PersistentFlags().BoolVar(
+		&skipConfigValidation, "skip-config-validation", false,
+		"Skip validation of stack config values against the project config schema. "+
+			"Config validation is skipped automatically when --run-program is not set.")
 
 	cmd.PersistentFlags().BoolVarP(
 		&debug, "debug", "d", false,
@@ -406,8 +429,9 @@ func NewDestroyCmd() *cobra.Command {
 		&stackName, "stack", "s", "",
 		"The name of the stack to operate on. Defaults to the current stack")
 	cmd.PersistentFlags().StringVar(
-		&cmdStack.ConfigFile, "config-file", "",
+		&configFile, "config-file", "",
 		"Use the configuration values in the specified file rather than detecting the file name")
+	config.OverrideEnvFlag(cmd, &envOverrides)
 	cmd.PersistentFlags().StringArrayVarP(
 		&configArray, "config", "c", []string{},
 		"Config to use during the destroy and save to the stack config file")
@@ -555,9 +579,9 @@ func NewDestroyCmd() *cobra.Command {
 // We rely on the fact that `resources` is topologically sorted with respect to
 // its dependencies.  This function understands that providers live outside
 // this topological sort.
-func getProtectedExcludes(resources []*resource.State) ([]string, error) {
+func getProtectedExcludes(resources []*pkgresource.State) ([]string, error) {
 	dg := graph.NewDependencyGraph(resources)
-	protected := mapset.NewSet[*resource.State]()
+	protected := mapset.NewSet[*pkgresource.State]()
 
 	for _, resource := range resources {
 		if resource.Protect {

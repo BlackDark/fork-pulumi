@@ -31,13 +31,13 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/backend"
 	"github.com/pulumi/pulumi/pkg/v3/backend/backenderr"
 	cmdBackend "github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/backend"
+	"github.com/pulumi/pulumi/pkg/v3/registry"
 	"github.com/pulumi/pulumi/pkg/v3/util/testutil"
 	pkgWorkspace "github.com/pulumi/pulumi/pkg/v3/workspace"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag/colors"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/env"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/registry"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -62,8 +62,8 @@ func TestFilterOnName(t *testing.T) {
 		ctx := testContext(t)
 
 		source := newImpl(ctx, "name1",
-			ScopeAll, workspace.TemplateKindPulumiProject,
-			templateRepository(workspace.TemplateRepository{}, workspace.TemplateNotFoundError{}),
+			ScopeAll, TemplateKindPulumiProject,
+			templateRepository(TemplateRepository{}, TemplateNotFoundError{}),
 			env.NewEnv(mapStore),
 		)
 
@@ -105,7 +105,6 @@ func TestFilterOnName(t *testing.T) {
 				}, nil
 			},
 		}
-		testutil.MockBackendInstance(t, mockBackend)
 
 		testutil.MockLoginManager(t, &cmdBackend.MockLoginManager{
 			CurrentF: func(ctx context.Context, ws pkgWorkspace.Context, sink diag.Sink,
@@ -153,7 +152,6 @@ func TestFilterOnName(t *testing.T) {
 				}
 			},
 		}
-		testutil.MockBackendInstance(t, mockBackend)
 
 		testutil.MockLoginManager(t, &cmdBackend.MockLoginManager{
 			CurrentF: func(ctx context.Context, ws pkgWorkspace.Context, sink diag.Sink,
@@ -206,7 +204,6 @@ func TestMultipleTemplateSources_OrgTemplates(t *testing.T) {
 			}, nil
 		},
 	}
-	testutil.MockBackendInstance(t, mockBackend)
 
 	testutil.MockLoginManager(t, &cmdBackend.MockLoginManager{
 		CurrentF: func(ctx context.Context, ws pkgWorkspace.Context, sink diag.Sink,
@@ -228,13 +225,13 @@ func TestMultipleTemplateSources_OrgTemplates(t *testing.T) {
 runtime: dotnet
 description: An ASP.NET application running a simple container in a EKS Cluster
 `), 0o600))
-	repoTemplates := templateRepository(workspace.TemplateRepository{
+	repoTemplates := templateRepository(TemplateRepository{
 		Root:         repoTemplateDir,
 		SubDirectory: subdir,
 	}, nil)
 
 	source := newImpl(ctx, "",
-		ScopeAll, workspace.TemplateKindPulumiProject,
+		ScopeAll, TemplateKindPulumiProject,
 		repoTemplates, env.NewEnv(env.MapStore{
 			"PULUMI_DISABLE_REGISTRY_RESOLVE": "true",
 		}),
@@ -244,14 +241,14 @@ description: An ASP.NET application running a simple container in a EKS Cluster
 	require.NoError(t, err)
 	assert.ElementsMatch(t,
 		[]Template{
-			workspaceTemplate{t: workspace.Template{
+			projectTemplate{t: ProjectTemplate{
 				Dir:                subdir,
 				Name:               "sub",
 				ProjectName:        "template3",
 				ProjectDescription: "An ASP.NET application running a simple container in a EKS Cluster",
 			}},
-			orgTemplate{t: template1, org: "org1", source: source, backend: cmdBackend.BackendInstance},
-			orgTemplate{t: template2, org: "org1", source: source, backend: cmdBackend.BackendInstance},
+			orgTemplate{t: template1, org: "org1", source: source, backend: mockBackend},
+			orgTemplate{t: template2, org: "org1", source: source, backend: mockBackend},
 		},
 		template)
 }
@@ -272,7 +269,6 @@ func TestSurfaceListTemplateErrors_OrgTemplates(t *testing.T) {
 			return apitype.ListOrgTemplatesResponse{}, somethingWentWrong
 		},
 	}
-	testutil.MockBackendInstance(t, mockBackend)
 
 	testutil.MockLoginManager(t, &cmdBackend.MockLoginManager{
 		CurrentF: func(ctx context.Context, ws pkgWorkspace.Context, sink diag.Sink,
@@ -288,8 +284,8 @@ func TestSurfaceListTemplateErrors_OrgTemplates(t *testing.T) {
 	})
 
 	source := newImpl(ctx, "name1",
-		ScopeAll, workspace.TemplateKindPulumiProject,
-		templateRepository(workspace.TemplateRepository{}, workspace.TemplateNotFoundError{}),
+		ScopeAll, TemplateKindPulumiProject,
+		templateRepository(TemplateRepository{}, TemplateNotFoundError{}),
 		env.NewEnv(env.MapStore{"PULUMI_DISABLE_REGISTRY_RESOLVE": "true"}),
 	)
 
@@ -318,7 +314,6 @@ func TestSurfaceListTemplateErrors_RegistryTemplates(t *testing.T) {
 	mockBackend := &backend.MockBackend{
 		GetReadOnlyCloudRegistryF: func() registry.Registry { return mockRegistry },
 	}
-	testutil.MockBackendInstance(t, mockBackend)
 
 	testutil.MockLoginManager(t, &cmdBackend.MockLoginManager{
 		CurrentF: func(ctx context.Context, ws pkgWorkspace.Context, sink diag.Sink,
@@ -334,8 +329,8 @@ func TestSurfaceListTemplateErrors_RegistryTemplates(t *testing.T) {
 	})
 
 	source := newImpl(ctx, "name1",
-		ScopeAll, workspace.TemplateKindPulumiProject,
-		templateRepository(workspace.TemplateRepository{}, workspace.TemplateNotFoundError{}),
+		ScopeAll, TemplateKindPulumiProject,
+		templateRepository(TemplateRepository{}, TemplateNotFoundError{}),
 		env.NewEnv(env.MapStore{
 			"PULUMI_DISABLE_REGISTRY_RESOLVE": "false",
 			"PULUMI_EXPERIMENTAL":             "true",
@@ -360,7 +355,6 @@ func TestSurfaceOnEmptyError_OrgTemplates(t *testing.T) {
 			return apitype.ListOrgTemplatesResponse{}, nil
 		},
 	}
-	testutil.MockBackendInstance(t, mockBackend)
 
 	testutil.MockLoginManager(t, &cmdBackend.MockLoginManager{
 		CurrentF: func(ctx context.Context, ws pkgWorkspace.Context, sink diag.Sink,
@@ -376,15 +370,15 @@ func TestSurfaceOnEmptyError_OrgTemplates(t *testing.T) {
 	})
 
 	source := newImpl(ctx, "name1",
-		ScopeAll, workspace.TemplateKindPulumiProject,
-		templateRepository(workspace.TemplateRepository{}, workspace.TemplateNotFoundError{}),
+		ScopeAll, TemplateKindPulumiProject,
+		templateRepository(TemplateRepository{}, TemplateNotFoundError{}),
 		env.NewEnv(env.MapStore{
 			"PULUMI_DISABLE_REGISTRY_RESOLVE": "true",
 		}),
 	)
 
 	_, err := source.Templates()
-	var expected workspace.TemplateNotFoundError
+	var expected TemplateNotFoundError
 	assert.ErrorAsf(t, err, &expected, "what's in %#v", source.errorOnEmpty)
 }
 
@@ -406,7 +400,6 @@ func TestSurfaceOnEmptyError_RegistryTemplates(t *testing.T) {
 			return mockRegistry
 		},
 	}
-	testutil.MockBackendInstance(t, mockBackend)
 
 	testutil.MockLoginManager(t, &cmdBackend.MockLoginManager{
 		CurrentF: func(ctx context.Context, ws pkgWorkspace.Context, sink diag.Sink,
@@ -422,8 +415,8 @@ func TestSurfaceOnEmptyError_RegistryTemplates(t *testing.T) {
 	})
 
 	source := newImpl(ctx, "name1",
-		ScopeAll, workspace.TemplateKindPulumiProject,
-		templateRepository(workspace.TemplateRepository{}, workspace.TemplateNotFoundError{}),
+		ScopeAll, TemplateKindPulumiProject,
+		templateRepository(TemplateRepository{}, TemplateNotFoundError{}),
 		env.NewEnv(env.MapStore{
 			"PULUMI_DISABLE_REGISTRY_RESOLVE": "false",
 			"PULUMI_EXPERIMENTAL":             "true",
@@ -431,7 +424,7 @@ func TestSurfaceOnEmptyError_RegistryTemplates(t *testing.T) {
 	)
 
 	_, err := source.Templates()
-	var expected workspace.TemplateNotFoundError
+	var expected TemplateNotFoundError
 	assert.ErrorAsf(t, err, &expected, "what's in %#v", source.errorOnEmpty)
 }
 
@@ -477,7 +470,6 @@ description: An ASP.NET application running a simple container in a EKS Cluster
 			}, nil
 		},
 	}
-	testutil.MockBackendInstance(t, mockBackend)
 
 	testutil.MockLoginManager(t, &cmdBackend.MockLoginManager{
 		CurrentF: func(ctx context.Context, ws pkgWorkspace.Context, sink diag.Sink,
@@ -493,8 +485,8 @@ description: An ASP.NET application running a simple container in a EKS Cluster
 	})
 
 	source := newImpl(ctx, "name1",
-		ScopeAll, workspace.TemplateKindPulumiProject,
-		templateRepository(workspace.TemplateRepository{}, workspace.TemplateNotFoundError{}),
+		ScopeAll, TemplateKindPulumiProject,
+		templateRepository(TemplateRepository{}, TemplateNotFoundError{}),
 		env.NewEnv(env.MapStore{
 			"PULUMI_DISABLE_REGISTRY_RESOLVE": "true",
 		}),
@@ -503,7 +495,7 @@ description: An ASP.NET application running a simple container in a EKS Cluster
 	template, err := source.Templates()
 	require.NoError(t, err)
 	assert.Equal(t,
-		[]Template{orgTemplate{t: template1, org: "org1", source: source, backend: cmdBackend.BackendInstance}},
+		[]Template{orgTemplate{t: template1, org: "org1", source: source, backend: mockBackend}},
 		template)
 	t.Cleanup(func() {
 		require.NoError(t, source.Close())
@@ -583,12 +575,17 @@ func createMockRegistrySource(
 	mockBackend := &backend.MockBackend{
 		GetReadOnlyCloudRegistryF: func() registry.Registry { return mockRegistry },
 	}
-	testutil.MockBackendInstance(t, mockBackend)
-	testutil.MockLoginManager(t, &cmdBackend.MockLoginManager{ /* panic on use */ })
+	testutil.MockLoginManager(t, &cmdBackend.MockLoginManager{
+		CurrentF: func(ctx context.Context, ws pkgWorkspace.Context, sink diag.Sink,
+			url string, project *workspace.Project, setCurrent bool,
+		) (backend.Backend, error) {
+			return mockBackend, nil
+		},
+	})
 
 	return newImpl(ctx, "name1",
-		ScopeAll, workspace.TemplateKindPulumiProject,
-		templateRepository(workspace.TemplateRepository{}, workspace.TemplateNotFoundError{}),
+		ScopeAll, TemplateKindPulumiProject,
+		templateRepository(TemplateRepository{}, TemplateNotFoundError{}),
 		env.NewEnv(env.MapStore{
 			"PULUMI_DISABLE_REGISTRY_RESOLVE": "false",
 			"PULUMI_EXPERIMENTAL":             "true",
@@ -695,11 +692,21 @@ func TestVCSBasedTemplateNames(t *testing.T) {
 	mockBackend := &backend.MockBackend{
 		GetReadOnlyCloudRegistryF: func() registry.Registry { return mockRegistry },
 	}
-	testutil.MockBackendInstance(t, mockBackend)
-	testutil.MockLoginManager(t, &cmdBackend.MockLoginManager{ /* panic on use */ })
+	testutil.MockLoginManager(t, &cmdBackend.MockLoginManager{
+		CurrentF: func(ctx context.Context, ws pkgWorkspace.Context, sink diag.Sink,
+			url string, project *workspace.Project, setCurrent bool,
+		) (backend.Backend, error) {
+			return mockBackend, nil
+		},
+		LoginF: func(ctx context.Context, ws pkgWorkspace.Context, sink diag.Sink,
+			url string, project *workspace.Project, setCurrent bool, insecure bool, color colors.Colorization,
+		) (backend.Backend, error) {
+			return mockBackend, nil
+		},
+	})
 
-	source := newImpl(ctx, "", ScopeAll, workspace.TemplateKindPulumiProject,
-		templateRepository(workspace.TemplateRepository{}, workspace.TemplateNotFoundError{}),
+	source := newImpl(ctx, "", ScopeAll, TemplateKindPulumiProject,
+		templateRepository(TemplateRepository{}, TemplateNotFoundError{}),
 		env.NewEnv(env.MapStore{
 			"PULUMI_DISABLE_REGISTRY_RESOLVE": "false",
 			"PULUMI_EXPERIMENTAL":             "true",
@@ -759,11 +766,21 @@ func TestVCSBasedTemplateNameFilter(t *testing.T) {
 	mockBackend := &backend.MockBackend{
 		GetReadOnlyCloudRegistryF: func() registry.Registry { return mockRegistry },
 	}
-	testutil.MockBackendInstance(t, mockBackend)
-	testutil.MockLoginManager(t, &cmdBackend.MockLoginManager{ /* panic on use */ })
+	testutil.MockLoginManager(t, &cmdBackend.MockLoginManager{
+		CurrentF: func(ctx context.Context, ws pkgWorkspace.Context, sink diag.Sink,
+			url string, project *workspace.Project, setCurrent bool,
+		) (backend.Backend, error) {
+			return mockBackend, nil
+		},
+		LoginF: func(ctx context.Context, ws pkgWorkspace.Context, sink diag.Sink,
+			url string, project *workspace.Project, setCurrent bool, insecure bool, color colors.Colorization,
+		) (backend.Backend, error) {
+			return mockBackend, nil
+		},
+	})
 
-	source := newImpl(ctx, "target", ScopeAll, workspace.TemplateKindPulumiProject,
-		templateRepository(workspace.TemplateRepository{}, workspace.TemplateNotFoundError{}),
+	source := newImpl(ctx, "target", ScopeAll, TemplateKindPulumiProject,
+		templateRepository(TemplateRepository{}, TemplateNotFoundError{}),
 		env.NewEnv(env.MapStore{
 			"PULUMI_DISABLE_REGISTRY_RESOLVE": "false",
 			"PULUMI_EXPERIMENTAL":             "true",
@@ -781,10 +798,10 @@ func TestVCSBasedTemplateNameFilter(t *testing.T) {
 	assert.Equal(t, "This is from the registry", templates[1].Description())
 }
 
-func templateRepository(repo workspace.TemplateRepository, err error) getWorkspaceTemplateFunc {
+func templateRepository(repo TemplateRepository, err error) getProjectTemplateFunc {
 	return func(ctx context.Context, templateNamePathOrURL string, offline bool,
-		templateKind workspace.TemplateKind,
-	) (workspace.TemplateRepository, error) {
+		templateKind TemplateKind,
+	) (TemplateRepository, error) {
 		return repo, err
 	}
 }
@@ -839,8 +856,18 @@ func TestRegistryTemplateResolution(t *testing.T) {
 	mockBackend := &backend.MockBackend{
 		GetReadOnlyCloudRegistryF: func() registry.Registry { return mockRegistry },
 	}
-	testutil.MockBackendInstance(t, mockBackend)
-	testutil.MockLoginManager(t, &cmdBackend.MockLoginManager{ /* panic on use */ })
+	testutil.MockLoginManager(t, &cmdBackend.MockLoginManager{
+		CurrentF: func(ctx context.Context, ws pkgWorkspace.Context, sink diag.Sink,
+			url string, project *workspace.Project, setCurrent bool,
+		) (backend.Backend, error) {
+			return mockBackend, nil
+		},
+		LoginF: func(ctx context.Context, ws pkgWorkspace.Context, sink diag.Sink,
+			url string, project *workspace.Project, setCurrent bool, insecure bool, color colors.Colorization,
+		) (backend.Backend, error) {
+			return mockBackend, nil
+		},
+	})
 
 	testCases := []struct {
 		name                string
@@ -959,8 +986,8 @@ func TestRegistryTemplateResolution(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			source := newImpl(ctx, tc.templateURL, ScopeAll, workspace.TemplateKindPulumiProject,
-				templateRepository(workspace.TemplateRepository{}, workspace.TemplateNotFoundError{}),
+			source := newImpl(ctx, tc.templateURL, ScopeAll, TemplateKindPulumiProject,
+				templateRepository(TemplateRepository{}, TemplateNotFoundError{}),
 				env.NewEnv(env.MapStore{
 					"PULUMI_DISABLE_REGISTRY_RESOLVE": "false",
 					"PULUMI_EXPERIMENTAL":             "true",
@@ -980,7 +1007,7 @@ func TestRegistryTemplateResolution(t *testing.T) {
 				if tc.expectSpecificError != "" {
 					assert.Contains(t, err.Error(), tc.expectSpecificError)
 				} else {
-					var templateNotFound workspace.TemplateNotFoundError
+					var templateNotFound TemplateNotFoundError
 					assert.ErrorAs(t, err, &templateNotFound)
 				}
 			}
@@ -1035,8 +1062,18 @@ func TestVersionedTemplateResolution(t *testing.T) {
 	mockBackend := &backend.MockBackend{
 		GetReadOnlyCloudRegistryF: func() registry.Registry { return mockRegistry },
 	}
-	testutil.MockBackendInstance(t, mockBackend)
-	testutil.MockLoginManager(t, &cmdBackend.MockLoginManager{ /* panic on use */ })
+	testutil.MockLoginManager(t, &cmdBackend.MockLoginManager{
+		CurrentF: func(ctx context.Context, ws pkgWorkspace.Context, sink diag.Sink,
+			url string, project *workspace.Project, setCurrent bool,
+		) (backend.Backend, error) {
+			return mockBackend, nil
+		},
+		LoginF: func(ctx context.Context, ws pkgWorkspace.Context, sink diag.Sink,
+			url string, project *workspace.Project, setCurrent bool, insecure bool, color colors.Colorization,
+		) (backend.Backend, error) {
+			return mockBackend, nil
+		},
+	})
 
 	testCases := []struct {
 		name                string
@@ -1105,8 +1142,8 @@ func TestVersionedTemplateResolution(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			getTemplateCalls = nil
 
-			source := newImpl(ctx, tc.templateURL, ScopeAll, workspace.TemplateKindPulumiProject,
-				templateRepository(workspace.TemplateRepository{}, workspace.TemplateNotFoundError{}),
+			source := newImpl(ctx, tc.templateURL, ScopeAll, TemplateKindPulumiProject,
+				templateRepository(TemplateRepository{}, TemplateNotFoundError{}),
 				env.NewEnv(env.MapStore{
 					"PULUMI_DISABLE_REGISTRY_RESOLVE": "false",
 					"PULUMI_EXPERIMENTAL":             "true",
@@ -1155,12 +1192,22 @@ func TestVCSBackedTemplateRejectsVersion(t *testing.T) {
 	mockBackend := &backend.MockBackend{
 		GetReadOnlyCloudRegistryF: func() registry.Registry { return mockRegistry },
 	}
-	testutil.MockBackendInstance(t, mockBackend)
-	testutil.MockLoginManager(t, &cmdBackend.MockLoginManager{ /* panic on use */ })
+	testutil.MockLoginManager(t, &cmdBackend.MockLoginManager{
+		CurrentF: func(ctx context.Context, ws pkgWorkspace.Context, sink diag.Sink,
+			url string, project *workspace.Project, setCurrent bool,
+		) (backend.Backend, error) {
+			return mockBackend, nil
+		},
+		LoginF: func(ctx context.Context, ws pkgWorkspace.Context, sink diag.Sink,
+			url string, project *workspace.Project, setCurrent bool, insecure bool, color colors.Colorization,
+		) (backend.Backend, error) {
+			return mockBackend, nil
+		},
+	})
 
 	source := newImpl(ctx, "github/pulumi/pulumi%2Ftemplates%2Ftypescript@1.0.0",
-		ScopeAll, workspace.TemplateKindPulumiProject,
-		templateRepository(workspace.TemplateRepository{}, workspace.TemplateNotFoundError{}),
+		ScopeAll, TemplateKindPulumiProject,
+		templateRepository(TemplateRepository{}, TemplateNotFoundError{}),
 		env.NewEnv(env.MapStore{
 			"PULUMI_DISABLE_REGISTRY_RESOLVE": "false",
 			"PULUMI_EXPERIMENTAL":             "true",

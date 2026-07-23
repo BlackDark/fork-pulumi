@@ -27,11 +27,15 @@ linters:
     - copyloopvar
     - gocritic
     - requiredfield
+    - noosexit
   settings:
     custom:
       requiredfield:
         type: module
         description: Checks that required fields are set in struct literals (see go.abhg.dev/requiredfield)
+      noosexit:
+        type: module
+        description: Forbids process-terminating calls (os.Exit, cmdutil.Exit, cmdutil.ExitError) outside of main and TestMain
     usetesting:
       os-temp-dir: true
       context-background: true
@@ -83,6 +87,12 @@ linters:
           deny:
             - pkg: github.com/golang/protobuf
               desc: Use google.golang.org/protobuf instead
+        pkg-no-sdk-plugin:
+          files:
+            - '**/pkg/**/*.go'
+          deny:
+            - pkg: github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin
+              desc: The pkg module must not import sdk/go/common/resource/plugin
     goheader:
       values:
         regexp:
@@ -157,6 +167,10 @@ linters:
           msg: "use cmd.ErrOrStderr() instead of os.Stderr in pkg/cmd"
         - pattern: ^fmt\.Print(f|ln)?$
           msg: "use fmt.Fprint*(cmd.OutOrStdout(), ...) instead of fmt.Print* in pkg/cmd"
+        - pattern: ^logging\.V$
+          msg: "use log/slog directly instead of the logging wrapper (slog migration)"
+        - pattern: ^logging\.(Infof|Warningf|Errorf)$
+          msg: "use log/slog directly instead of the logging wrapper (slog migration)"
     revive:
       rules:
         - name: use-any
@@ -213,6 +227,10 @@ linters:
         text: 'use (cmd\.OutOrStdout|cmd\.ErrOrStderr|fmt\.Fprint\*)'
       - linters:
           - forbidigo
+        path-except: ^(pkg/util/nosleep|pkg/host|pkg/pluginstorage|pkg/cmd/pulumi)/
+        text: 'logging wrapper \(slog migration\)'
+      - linters:
+          - forbidigo
         path: _test\.go$
         text: 'use (cmd\.OutOrStdout|cmd\.ErrOrStderr|fmt\.Fprint\*)'
     paths:
@@ -221,6 +239,7 @@ linters:
       - node_modules
       - testdata$
       - third_party$
+      - third_party/
       - vendor$
 formatters:
   enable:
@@ -234,4 +253,5 @@ formatters:
       - node_modules
       - testdata$
       - third_party$
+      - third_party/
       - vendor$

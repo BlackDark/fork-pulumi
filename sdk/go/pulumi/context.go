@@ -337,12 +337,7 @@ func (ctx *Context) GetConfig(key string) (string, bool) {
 
 // IsConfigSecret returns true if the config value is a secret.
 func (ctx *Context) IsConfigSecret(key string) bool {
-	for _, secretKey := range ctx.state.info.ConfigSecretKeys {
-		if key == secretKey {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(ctx.state.info.ConfigSecretKeys, key)
 }
 
 // registerTransform starts up a callback server if not already running and registers the given transform.
@@ -410,6 +405,7 @@ func (ctx *Context) registerTransform(t ResourceTransform) (*pulumirpc.Callback,
 					Create: rpcReq.Options.CustomTimeouts.Create,
 					Update: rpcReq.Options.CustomTimeouts.Update,
 					Delete: rpcReq.Options.CustomTimeouts.Delete,
+					Read:   rpcReq.Options.CustomTimeouts.Read,
 				}
 			}
 			if rpcReq.Options.DeleteBeforeReplace != nil {
@@ -526,6 +522,7 @@ func (ctx *Context) registerTransform(t ResourceTransform) (*pulumirpc.Callback,
 					Create: opts.CustomTimeouts.Create,
 					Update: opts.CustomTimeouts.Update,
 					Delete: opts.CustomTimeouts.Delete,
+					Read:   opts.CustomTimeouts.Read,
 				}
 			}
 
@@ -1101,7 +1098,7 @@ func (ctx *Context) CallPackage(
 		// Convert the arg dependencies map for RPC and remove duplicates.
 		rpcArgDeps := make(map[string]*pulumirpc.ResourceCallRequest_ArgumentDependencies)
 		for k, deps := range argDeps {
-			sort.Slice(deps, func(i, j int) bool { return deps[i] < deps[j] })
+			slices.Sort(deps)
 
 			urns := slice.Prealloc[string](len(deps))
 			for i, d := range deps {
@@ -1909,6 +1906,12 @@ func (ctx *Context) registerResource(
 				}
 				deps[key] = resources
 			}
+			// If the engine reported that the resource failed or was skipped, synthesize an
+			// error so downstream outputs fault. This allows Output.Recover to intercept the
+			// failure.
+			if err == nil && resp.Result != pulumirpc.Result_SUCCESS {
+				err = fmt.Errorf("resource %s [%s] failed to register", name, t)
+			}
 		}
 	}()
 
@@ -2032,6 +2035,9 @@ type resourceState struct {
 	transformations   []ResourceTransformation
 }
 
+var errTransformationsCannotChangeParent = errors.New(
+	"transformations cannot currently be used to change the `parent` of a resource")
+
 // Apply transformations and return the transformations themselves, as well as the transformed props and opts.
 func applyTransformations(t, name string, props Input, resource Resource, opts []ResourceOption,
 	options *resourceOptions,
@@ -2055,8 +2061,9 @@ func applyTransformations(t, name string, props Input, resource Resource, opts [
 			resOptions := merge(res.Opts...)
 
 			if resOptions.Parent != nil && resOptions.Parent.URN() != options.Parent.URN() {
-				return nil, nil, nil, errors.New("transformations cannot currently be used to change the `parent` of a resource")
+				return nil, nil, nil, errTransformationsCannotChangeParent
 			}
+			resOptions.Parent = options.Parent // Callers *must* re-apply the parent option, so we do it for them
 			props = res.Props
 			options = resOptions
 		}
@@ -2072,15 +2079,11 @@ func (ctx *Context) mergeProviders(t string, parent Resource, provider ProviderR
 	// copy parent providers
 	result := make(map[string]ProviderResource)
 	if parent != nil {
-		for k, v := range parent.getProviders() {
-			result[k] = v
-		}
+		maps.Copy(result, parent.getProviders())
 	}
 
 	// copy provider map
-	for k, v := range providerMap {
-		result[k] = v
-	}
+	maps.Copy(result, providerMap)
 
 	// copy specific provider, if any
 	if provider != nil {
@@ -2169,7 +2172,7 @@ func (ctx *Context) collapseAliases(aliases []Alias, t, name string, parent Reso
 	return aliasURNs, nil
 }
 
-var mapOutputType = reflect.TypeOf((*MapOutput)(nil)).Elem()
+var mapOutputType = reflect.TypeFor[MapOutput]()
 
 // makeResourceState creates a set of resolvers that we'll use to finalize state, for URNs, IDs, and output
 // properties.
@@ -2728,6 +2731,7 @@ func getTimeouts(custom *CustomTimeouts) *pulumirpc.RegisterResourceRequest_Cust
 		timeouts.Update = custom.Update
 		timeouts.Create = custom.Create
 		timeouts.Delete = custom.Delete
+		timeouts.Read = custom.Read
 	}
 	return &timeouts
 }

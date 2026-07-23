@@ -19,9 +19,12 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	pkgresource "github.com/pulumi/pulumi/pkg/v3/resource"
 
 	"github.com/blang/semver"
 	combinations "github.com/mxschmitt/golang-combinations"
@@ -33,9 +36,9 @@ import (
 	lt "github.com/pulumi/pulumi/pkg/v3/engine/lifecycletest/framework"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy/deploytest"
+	"github.com/pulumi/pulumi/pkg/v3/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/providers"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
@@ -88,7 +91,7 @@ func TestRefreshTargetChildren(t *testing.T) {
 		return nil
 	})
 
-	hostF := deploytest.NewPluginHostF(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, program, nil, nil, loaders...)
 	opts := lt.TestUpdateOptions{T: t, HostF: hostF}
 
 	snap, err := lt.TestOp(Update).RunStep(project, p.GetTarget(t, nil), opts, false, p.BackendClient, nil, "0")
@@ -203,7 +206,7 @@ func TestExcludeTarget(t *testing.T) {
 		return nil
 	})
 
-	hostF := deploytest.NewPluginHostF(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, program, nil, nil, loaders...)
 
 	opts := lt.TestUpdateOptions{T: t, HostF: hostF}
 	opts.Excludes = deploy.NewUrnTargetsFromUrns([]resource.URN{
@@ -249,7 +252,7 @@ func TestExcludeChildren(t *testing.T) {
 		return nil
 	})
 
-	hostF := deploytest.NewPluginHostF(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, program, nil, nil, loaders...)
 
 	opts := lt.TestUpdateOptions{T: t, HostF: hostF}
 	opts.ExcludeDependents = true
@@ -294,7 +297,7 @@ func TestDestroyExcludeTarget(t *testing.T) {
 		return nil
 	})
 
-	hostF := deploytest.NewPluginHostF(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, program, nil, nil, loaders...)
 	opts := lt.TestUpdateOptions{T: t, HostF: hostF}
 
 	snap, err := lt.TestOp(Update).RunStep(project, p.GetTarget(t, nil), opts, false, p.BackendClient, nil, "0")
@@ -358,7 +361,7 @@ func TestDestroyExcludeChildren(t *testing.T) {
 		return nil
 	})
 
-	hostF := deploytest.NewPluginHostF(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, program, nil, nil, loaders...)
 	opts := lt.TestUpdateOptions{T: t, HostF: hostF}
 
 	snap, err := lt.TestOp(Update).RunStep(project, p.GetTarget(t, nil), opts, false, p.BackendClient, nil, "0")
@@ -409,7 +412,7 @@ func TestExcludeProviderImplicitly(t *testing.T) {
 		return nil
 	})
 
-	hostF := deploytest.NewPluginHostF(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, program, nil, nil, loaders...)
 	opts := lt.TestUpdateOptions{T: t, HostF: hostF}
 
 	snap, err := lt.TestOp(Update).RunStep(project, p.GetTarget(t, nil), opts, false, p.BackendClient, nil, "1")
@@ -459,7 +462,7 @@ func TestGlobExcludes(t *testing.T) {
 		return nil
 	})
 
-	hostF := deploytest.NewPluginHostF(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, program, nil, nil, loaders...)
 	opts := lt.TestUpdateOptions{T: t, HostF: hostF}
 
 	snap, err := lt.TestOp(Update).RunStep(project, p.GetTarget(t, nil), opts, false, p.BackendClient, nil, "0")
@@ -528,7 +531,7 @@ func TestRefreshExcludeTarget(t *testing.T) {
 		return nil
 	})
 
-	hostF := deploytest.NewPluginHostF(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, program, nil, nil, loaders...)
 	opts := lt.TestUpdateOptions{T: t, HostF: hostF}
 
 	snap, err := lt.TestOp(Update).RunStep(project, p.GetTarget(t, nil), opts, false, p.BackendClient, nil, "0")
@@ -608,7 +611,7 @@ func TestRefreshExcludeChildren(t *testing.T) {
 		return nil
 	})
 
-	hostF := deploytest.NewPluginHostF(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, program, nil, nil, loaders...)
 	opts := lt.TestUpdateOptions{T: t, HostF: hostF}
 
 	snap, err := lt.TestOp(Update).RunStep(project, p.GetTarget(t, nil), opts, false, p.BackendClient, nil, "0")
@@ -683,7 +686,7 @@ func destroySpecificTargets(
 		}),
 	}
 
-	p.Options.HostF = deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	p.Options.HostF = deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 	p.Options.TargetDependents = targetDependents
 
 	destroyTargets := slice.Prealloc[resource.URN](len(targets))
@@ -804,7 +807,7 @@ func updateSpecificTargets(t *testing.T, targets, globTargets []string, targetDe
 		}),
 	}
 
-	p.Options.HostF = deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	p.Options.HostF = deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 	p.Options.TargetDependents = targetDependents
 	p.Options.T = t
 	updateTargets := globTargets
@@ -876,12 +879,7 @@ func updateSpecificTargets(t *testing.T, targets, globTargets []string, targetDe
 }
 
 func contains(list []string, entry string) bool {
-	for _, e := range list {
-		if e == entry {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(list, entry)
 }
 
 func updateInvalidTarget(t *testing.T) {
@@ -912,7 +910,7 @@ func updateInvalidTarget(t *testing.T) {
 		}),
 	}
 
-	p.Options.HostF = deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	p.Options.HostF = deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 	p.Options.T = t
 
 	p.Options.Targets = deploy.NewUrnTargetsFromUrns([]resource.URN{"foo"})
@@ -940,7 +938,7 @@ func TestCreateDuringTargetedUpdate_CreateMentionedAsTarget(t *testing.T) {
 		require.NoError(t, err)
 		return nil
 	})
-	host1F := deploytest.NewPluginHostF(nil, nil, program1F, loaders...)
+	host1F := deploytest.NewPluginHostF(nil, nil, program1F, nil, nil, loaders...)
 
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: host1F},
@@ -959,7 +957,7 @@ func TestCreateDuringTargetedUpdate_CreateMentionedAsTarget(t *testing.T) {
 
 		return nil
 	})
-	host2F := deploytest.NewPluginHostF(nil, nil, program2F, loaders...)
+	host2F := deploytest.NewPluginHostF(nil, nil, program2F, nil, nil, loaders...)
 
 	resA := p.NewURN("pkgA:m:typA", "resA", "")
 	resB := p.NewURN("pkgA:m:typA", "resB", "")
@@ -1002,7 +1000,7 @@ func TestCreateDuringTargetedUpdate_UntargetedCreateNotReferenced(t *testing.T) 
 		require.NoError(t, err)
 		return nil
 	})
-	host1F := deploytest.NewPluginHostF(nil, nil, program1F, loaders...)
+	host1F := deploytest.NewPluginHostF(nil, nil, program1F, nil, nil, loaders...)
 
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: host1F},
@@ -1021,7 +1019,7 @@ func TestCreateDuringTargetedUpdate_UntargetedCreateNotReferenced(t *testing.T) 
 
 		return nil
 	})
-	host2F := deploytest.NewPluginHostF(nil, nil, program2F, loaders...)
+	host2F := deploytest.NewPluginHostF(nil, nil, program2F, nil, nil, loaders...)
 
 	resA := p.NewURN("pkgA:m:typA", "resA", "")
 
@@ -1084,7 +1082,7 @@ func TestCreateDuringTargetedUpdate_UntargetedCreateReferencedByChangedTarget(t 
 		return nil
 	})
 
-	beforeHostF := deploytest.NewPluginHostF(nil, nil, beforeF, beforeLoaders...)
+	beforeHostF := deploytest.NewPluginHostF(nil, nil, beforeF, nil, nil, beforeLoaders...)
 
 	snap, err := lt.TestOp(Update).RunStep(project, p.GetTarget(t, nil), lt.TestUpdateOptions{
 		T:     t,
@@ -1116,7 +1114,7 @@ func TestCreateDuringTargetedUpdate_UntargetedCreateReferencedByChangedTarget(t 
 		return nil
 	})
 
-	afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, afterLoaders...)
+	afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, nil, nil, afterLoaders...)
 
 	_, err = lt.TestOp(Update).RunStep(project, p.GetTarget(t, snap), lt.TestUpdateOptions{
 		T:     t,
@@ -1159,7 +1157,7 @@ func TestCreateDuringTargetedUpdate_UntargetedCreateReferencedByUnchangedTarget(
 		return nil
 	})
 
-	beforeHostF := deploytest.NewPluginHostF(nil, nil, beforeF, loaders...)
+	beforeHostF := deploytest.NewPluginHostF(nil, nil, beforeF, nil, nil, loaders...)
 
 	snap, err := lt.TestOp(Update).RunStep(project, p.GetTarget(t, nil), lt.TestUpdateOptions{
 		T:     t,
@@ -1185,7 +1183,7 @@ func TestCreateDuringTargetedUpdate_UntargetedCreateReferencedByUnchangedTarget(
 		return nil
 	})
 
-	afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, loaders...)
+	afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, nil, nil, loaders...)
 
 	_, err = lt.TestOp(Update).RunStep(project, p.GetTarget(t, snap), lt.TestUpdateOptions{
 		T:     t,
@@ -1235,7 +1233,7 @@ func TestCreateDuringTargetedUpdate_UntargetedCreateReferencedByTargetPropertyDe
 		return nil
 	})
 
-	beforeHostF := deploytest.NewPluginHostF(nil, nil, beforeF, beforeLoaders...)
+	beforeHostF := deploytest.NewPluginHostF(nil, nil, beforeF, nil, nil, beforeLoaders...)
 
 	snap, err := lt.TestOp(Update).RunStep(project, p.GetTarget(t, nil), lt.TestUpdateOptions{
 		T:     t,
@@ -1269,7 +1267,7 @@ func TestCreateDuringTargetedUpdate_UntargetedCreateReferencedByTargetPropertyDe
 		return nil
 	})
 
-	afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, afterLoaders...)
+	afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, nil, nil, afterLoaders...)
 
 	_, err = lt.TestOp(Update).RunStep(project, p.GetTarget(t, snap), lt.TestUpdateOptions{
 		T:     t,
@@ -1319,7 +1317,7 @@ func TestCreateDuringTargetedUpdate_UntargetedCreateReferencedByTargetDeletedWit
 		return nil
 	})
 
-	beforeHostF := deploytest.NewPluginHostF(nil, nil, beforeF, beforeLoaders...)
+	beforeHostF := deploytest.NewPluginHostF(nil, nil, beforeF, nil, nil, beforeLoaders...)
 
 	snap, err := lt.TestOp(Update).RunStep(project, p.GetTarget(t, nil), lt.TestUpdateOptions{
 		T:     t,
@@ -1351,7 +1349,7 @@ func TestCreateDuringTargetedUpdate_UntargetedCreateReferencedByTargetDeletedWit
 		return nil
 	})
 
-	afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, afterLoaders...)
+	afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, nil, nil, afterLoaders...)
 
 	_, err = lt.TestOp(Update).RunStep(project, p.GetTarget(t, snap), lt.TestUpdateOptions{
 		T:     t,
@@ -1403,7 +1401,7 @@ func TestCreateDuringTargetedUpdate_UntargetedCreateReferencedByTargetParent(t *
 		return nil
 	})
 
-	beforeHostF := deploytest.NewPluginHostF(nil, nil, beforeF, beforeLoaders...)
+	beforeHostF := deploytest.NewPluginHostF(nil, nil, beforeF, nil, nil, beforeLoaders...)
 
 	snap, err := lt.TestOp(Update).RunStep(project, p.GetTarget(t, nil), lt.TestUpdateOptions{
 		T:     t,
@@ -1436,7 +1434,7 @@ func TestCreateDuringTargetedUpdate_UntargetedCreateReferencedByTargetParent(t *
 		return nil
 	})
 
-	afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, afterLoaders...)
+	afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, nil, nil, afterLoaders...)
 
 	_, err = lt.TestOp(Update).RunStep(project, p.GetTarget(t, snap), lt.TestUpdateOptions{
 		T:     t,
@@ -1472,7 +1470,7 @@ func TestCreateDuringTargetedUpdate_UntargetedProviderReferencedByTarget(t *test
 		require.NoError(t, err)
 		return nil
 	})
-	host1F := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	host1F := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: host1F},
@@ -1501,7 +1499,7 @@ func TestCreateDuringTargetedUpdate_UntargetedCreateReferencedByUntargetedCreate
 		require.NoError(t, err)
 		return nil
 	})
-	host1F := deploytest.NewPluginHostF(nil, nil, program1F, loaders...)
+	host1F := deploytest.NewPluginHostF(nil, nil, program1F, nil, nil, loaders...)
 
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: host1F},
@@ -1530,7 +1528,7 @@ func TestCreateDuringTargetedUpdate_UntargetedCreateReferencedByUntargetedCreate
 
 		return nil
 	})
-	host2F := deploytest.NewPluginHostF(nil, nil, program2F, loaders...)
+	host2F := deploytest.NewPluginHostF(nil, nil, program2F, nil, nil, loaders...)
 
 	p.Options.HostF = host2F
 	p.Options.Targets = deploy.NewUrnTargetsFromUrns([]resource.URN{resA})
@@ -1587,7 +1585,7 @@ func TestReplaceSpecificTargets(t *testing.T) {
 		}),
 	}
 
-	p.Options.HostF = deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	p.Options.HostF = deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 	p.Options.T = t
 	getURN := func(name string) resource.URN {
 		return pickURN(t, urns, complexTestDependencyGraphNames, name)
@@ -1687,13 +1685,13 @@ func generateParentedTestDependencyGraph(t *testing.T, p *lt.TestPlan) (
 
 	newResource := func(urn, parent resource.URN, id resource.ID,
 		dependencies []resource.URN, propertyDeps propertyDependencies,
-	) *resource.State {
+	) *pkgresource.State {
 		return newResource(urn, parent, id, "", dependencies, propertyDeps,
 			nil, urn.Type() != resTypeComponent)
 	}
 
 	old := &deploy.Snapshot{
-		Resources: []*resource.State{
+		Resources: []*pkgresource.State{
 			newResource(urnA, "", "", nil, nil),
 			newResource(urnB, "", "", nil, nil),
 			newResource(urnC, "", "2", nil, nil),
@@ -1826,7 +1824,7 @@ func destroySpecificTargetsWithChildren(
 		}, deploytest.WithGrpc),
 	}
 
-	p.Options.HostF = deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	p.Options.HostF = deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 	p.Options.TargetDependents = targetDependents
 
 	destroyTargets := slice.Prealloc[resource.URN](len(targets))
@@ -1872,7 +1870,7 @@ func destroySpecificTargetsWithChildren(
 
 func newResource(urn, parent resource.URN, id resource.ID, provider string, dependencies []resource.URN,
 	propertyDeps propertyDependencies, outputs resource.PropertyMap, custom bool,
-) *resource.State {
+) *pkgresource.State {
 	inputs := resource.PropertyMap{}
 	for k := range propertyDeps {
 		inputs[k] = resource.NewProperty("foo")
@@ -1881,7 +1879,7 @@ func newResource(urn, parent resource.URN, id resource.ID, provider string, depe
 		outputs = resource.PropertyMap{}
 	}
 
-	return &resource.State{
+	return &pkgresource.State{
 		Type:                 urn.Type(),
 		URN:                  urn,
 		Custom:               custom,
@@ -1914,7 +1912,7 @@ func TestTargetedCreateDefaultProvider(t *testing.T) {
 		return nil
 	})
 
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 
 	p := &lt.TestPlan{}
 
@@ -1944,7 +1942,7 @@ func TestTargetedCreateDefaultProvider(t *testing.T) {
 }
 
 // Returns the resource with the matching URN, or nil.
-func findResourceByURN(rs []*resource.State, urn resource.URN) *resource.State {
+func findResourceByURN(rs []*pkgresource.State, urn resource.URN) *pkgresource.State {
 	for _, r := range rs {
 		if r.URN == urn {
 			return r
@@ -1996,7 +1994,7 @@ func TestEnsureUntargetedSame(t *testing.T) {
 		return nil
 	})
 
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 	p := &lt.TestPlan{}
 
 	project := p.GetProject()
@@ -2081,7 +2079,7 @@ func TestReplaceSpecificTargetsPlan(t *testing.T) {
 		return nil
 	})
 
-	p.Options.HostF = deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	p.Options.HostF = deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 
 	project := p.GetProject()
 
@@ -2258,7 +2256,7 @@ func TestTargetDependents(t *testing.T) {
 		return nil
 	})
 
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 	p := &lt.TestPlan{}
 
 	project := p.GetProject()
@@ -2326,7 +2324,7 @@ func TestTargetDependentsExplicitProvider(t *testing.T) {
 		return nil
 	})
 
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 	p := &lt.TestPlan{}
 
 	project := p.GetProject()
@@ -2418,7 +2416,7 @@ func TestTargetDependentsSiblingResources(t *testing.T) {
 		return nil
 	})
 
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 	p := &lt.TestPlan{}
 
 	project := p.GetProject()
@@ -2492,7 +2490,7 @@ func TestTargetUntargetedParent(t *testing.T) {
 	}
 
 	hostFF := func(expectError bool) deploytest.PluginHostFactory {
-		return deploytest.NewPluginHostF(nil, nil, programFF(expectError), loaders...)
+		return deploytest.NewPluginHostF(nil, nil, programFF(expectError), nil, nil, loaders...)
 	}
 	p := &lt.TestPlan{}
 
@@ -2580,7 +2578,7 @@ func TestTargetDestroyDependencyErrors(t *testing.T) {
 		require.NoError(t, err)
 		return nil
 	})
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
@@ -2643,7 +2641,7 @@ func TestTargetDestroyChildErrors(t *testing.T) {
 		require.NoError(t, err)
 		return nil
 	})
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
@@ -2704,7 +2702,7 @@ func TestTargetDestroyDeleteFails(t *testing.T) {
 		require.NoError(t, err)
 		return nil
 	})
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
@@ -2773,7 +2771,7 @@ func TestTargetDestroyDependencyDeleteFails(t *testing.T) {
 
 		return nil
 	})
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
@@ -2862,7 +2860,7 @@ func TestTargetDestroyChildDeleteFails(t *testing.T) {
 
 		return nil
 	})
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
@@ -2966,8 +2964,8 @@ func TestDependencyUnreleatedToTargetUpdatedSucceeds(t *testing.T) {
 		return nil
 	})
 
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
-	hostF2 := deploytest.NewPluginHostF(nil, nil, programF2, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
+	hostF2 := deploytest.NewPluginHostF(nil, nil, programF2, nil, nil, loaders...)
 	p := &lt.TestPlan{}
 
 	project := p.GetProject()
@@ -3061,9 +3059,9 @@ func TestTargetUntargetedParentWithUpdatedDependency(t *testing.T) {
 	})
 
 	hostFF := func(expectError bool) deploytest.PluginHostFactory {
-		return deploytest.NewPluginHostF(nil, nil, programFF(expectError), loaders...)
+		return deploytest.NewPluginHostF(nil, nil, programFF(expectError), nil, nil, loaders...)
 	}
-	hostF2 := deploytest.NewPluginHostF(nil, nil, programF2, loaders...)
+	hostF2 := deploytest.NewPluginHostF(nil, nil, programF2, nil, nil, loaders...)
 	p := &lt.TestPlan{}
 
 	project := p.GetProject()
@@ -3165,7 +3163,7 @@ func TestTargetChangeProviderVersion(t *testing.T) {
 		return nil
 	})
 
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 	options := lt.TestUpdateOptions{T: t, HostF: hostF}
 	p := &lt.TestPlan{}
 
@@ -3237,7 +3235,7 @@ func TestTargetChangeAndSameProviderVersion(t *testing.T) {
 		return nil
 	})
 
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 	options := lt.TestUpdateOptions{T: t, HostF: hostF}
 	p := &lt.TestPlan{}
 
@@ -3275,6 +3273,10 @@ func TestTargetChangeAndSameProviderVersion(t *testing.T) {
 // Parents and aliases are of particular interest because they result in URN
 // changes.
 func TestUntargetedDependencyChainsArePreserved(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping large targeted-update matrix in short mode")
+	}
+
 	t.Parallel()
 
 	// Arrange.
@@ -3331,7 +3333,7 @@ func TestUntargetedDependencyChainsArePreserved(t *testing.T) {
 			return nil
 		})
 
-		beforeHostF := deploytest.NewPluginHostF(nil, nil, beforeF, loaders...)
+		beforeHostF := deploytest.NewPluginHostF(nil, nil, beforeF, nil, nil, loaders...)
 
 		p := &lt.TestPlan{}
 		project := p.GetProject()
@@ -3368,7 +3370,7 @@ func TestUntargetedDependencyChainsArePreserved(t *testing.T) {
 			return nil
 		})
 
-		afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, loaders...)
+		afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, nil, nil, loaders...)
 
 		// Act.
 		snap, err = lt.TestOp(Update).RunStep(project, p.GetTarget(t, snap), lt.TestUpdateOptions{
@@ -3420,7 +3422,7 @@ func TestUntargetedDependencyChainsArePreserved(t *testing.T) {
 			return nil
 		})
 
-		beforeHostF := deploytest.NewPluginHostF(nil, nil, beforeF, loaders...)
+		beforeHostF := deploytest.NewPluginHostF(nil, nil, beforeF, nil, nil, loaders...)
 
 		// Actions:
 		//
@@ -3456,7 +3458,7 @@ func TestUntargetedDependencyChainsArePreserved(t *testing.T) {
 				return nil
 			})
 
-			afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, loaders...)
+			afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, nil, nil, loaders...)
 
 			// Act.
 			snap, err = lt.TestOp(Update).RunStep(project, p.GetTarget(t, snap), lt.TestUpdateOptions{
@@ -3504,7 +3506,7 @@ func TestUntargetedDependencyChainsArePreserved(t *testing.T) {
 				return nil
 			})
 
-			afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, loaders...)
+			afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, nil, nil, loaders...)
 
 			// Act.
 			snap, err = lt.TestOp(Update).RunStep(project, p.GetTarget(t, snap), lt.TestUpdateOptions{
@@ -3550,7 +3552,7 @@ func TestUntargetedDependencyChainsArePreserved(t *testing.T) {
 				return nil
 			})
 
-			afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, loaders...)
+			afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, nil, nil, loaders...)
 
 			// Act.
 			snap, err = lt.TestOp(Update).RunStep(project, p.GetTarget(t, snap), lt.TestUpdateOptions{
@@ -3606,7 +3608,7 @@ func TestUntargetedDependencyChainsArePreserved(t *testing.T) {
 			return nil
 		})
 
-		beforeHostF := deploytest.NewPluginHostF(nil, nil, beforeF, loaders...)
+		beforeHostF := deploytest.NewPluginHostF(nil, nil, beforeF, nil, nil, loaders...)
 
 		// Actions:
 		//
@@ -3651,7 +3653,7 @@ func TestUntargetedDependencyChainsArePreserved(t *testing.T) {
 				return nil
 			})
 
-			afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, loaders...)
+			afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, nil, nil, loaders...)
 
 			// Act.
 			snap, err = lt.TestOp(Update).RunStep(project, p.GetTarget(t, snap), lt.TestUpdateOptions{
@@ -3708,7 +3710,7 @@ func TestUntargetedDependencyChainsArePreserved(t *testing.T) {
 				return nil
 			})
 
-			afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, loaders...)
+			afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, nil, nil, loaders...)
 
 			// Act.
 			snap, err = lt.TestOp(Update).RunStep(project, p.GetTarget(t, snap), lt.TestUpdateOptions{
@@ -3763,7 +3765,7 @@ func TestUntargetedDependencyChainsArePreserved(t *testing.T) {
 				return nil
 			})
 
-			afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, loaders...)
+			afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, nil, nil, loaders...)
 
 			// Act.
 			snap, err = lt.TestOp(Update).RunStep(project, p.GetTarget(t, snap), lt.TestUpdateOptions{
@@ -3813,7 +3815,7 @@ func TestUntargetedDependencyChainsArePreserved(t *testing.T) {
 			return nil
 		})
 
-		beforeHostF := deploytest.NewPluginHostF(nil, nil, beforeF, loaders...)
+		beforeHostF := deploytest.NewPluginHostF(nil, nil, beforeF, nil, nil, loaders...)
 
 		// Actions:
 		//
@@ -3850,7 +3852,7 @@ func TestUntargetedDependencyChainsArePreserved(t *testing.T) {
 				return nil
 			})
 
-			afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, loaders...)
+			afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, nil, nil, loaders...)
 
 			// Act.
 			snap, err = lt.TestOp(Update).RunStep(project, p.GetTarget(t, snap), lt.TestUpdateOptions{
@@ -3899,7 +3901,7 @@ func TestUntargetedDependencyChainsArePreserved(t *testing.T) {
 				return nil
 			})
 
-			afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, loaders...)
+			afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, nil, nil, loaders...)
 
 			// Act.
 			snap, err = lt.TestOp(Update).RunStep(project, p.GetTarget(t, snap), lt.TestUpdateOptions{
@@ -3946,7 +3948,7 @@ func TestUntargetedDependencyChainsArePreserved(t *testing.T) {
 				return nil
 			})
 
-			afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, loaders...)
+			afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, nil, nil, loaders...)
 
 			// Act.
 			snap, err = lt.TestOp(Update).RunStep(project, p.GetTarget(t, snap), lt.TestUpdateOptions{
@@ -4000,7 +4002,7 @@ func TestUntargetedDependencyChainsArePreserved(t *testing.T) {
 			return nil
 		})
 
-		beforeHostF := deploytest.NewPluginHostF(nil, nil, beforeF, loaders...)
+		beforeHostF := deploytest.NewPluginHostF(nil, nil, beforeF, nil, nil, loaders...)
 
 		// Actions:
 		//
@@ -4039,7 +4041,7 @@ func TestUntargetedDependencyChainsArePreserved(t *testing.T) {
 				return nil
 			})
 
-			afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, loaders...)
+			afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, nil, nil, loaders...)
 
 			// Act.
 			snap, err = lt.TestOp(Update).RunStep(project, p.GetTarget(t, snap), lt.TestUpdateOptions{
@@ -4088,7 +4090,7 @@ func TestUntargetedDependencyChainsArePreserved(t *testing.T) {
 				return nil
 			})
 
-			afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, loaders...)
+			afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, nil, nil, loaders...)
 
 			// Act.
 			snap, err = lt.TestOp(Update).RunStep(project, p.GetTarget(t, snap), lt.TestUpdateOptions{
@@ -4135,7 +4137,7 @@ func TestUntargetedDependencyChainsArePreserved(t *testing.T) {
 				return nil
 			})
 
-			afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, loaders...)
+			afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, nil, nil, loaders...)
 
 			// Act.
 			snap, err = lt.TestOp(Update).RunStep(project, p.GetTarget(t, snap), lt.TestUpdateOptions{
@@ -4185,7 +4187,7 @@ func TestUntargetedDependencyChainsArePreserved(t *testing.T) {
 			return nil
 		})
 
-		beforeHostF := deploytest.NewPluginHostF(nil, nil, beforeF, loaders...)
+		beforeHostF := deploytest.NewPluginHostF(nil, nil, beforeF, nil, nil, loaders...)
 
 		// Actions:
 		//
@@ -4222,7 +4224,7 @@ func TestUntargetedDependencyChainsArePreserved(t *testing.T) {
 				return nil
 			})
 
-			afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, loaders...)
+			afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, nil, nil, loaders...)
 
 			// Act.
 			snap, err = lt.TestOp(Update).RunStep(project, p.GetTarget(t, snap), lt.TestUpdateOptions{
@@ -4271,7 +4273,7 @@ func TestUntargetedDependencyChainsArePreserved(t *testing.T) {
 				return nil
 			})
 
-			afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, loaders...)
+			afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, nil, nil, loaders...)
 
 			// Act.
 			snap, err = lt.TestOp(Update).RunStep(project, p.GetTarget(t, snap), lt.TestUpdateOptions{
@@ -4318,7 +4320,7 @@ func TestUntargetedDependencyChainsArePreserved(t *testing.T) {
 				return nil
 			})
 
-			afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, loaders...)
+			afterHostF := deploytest.NewPluginHostF(nil, nil, afterF, nil, nil, loaders...)
 
 			// Act.
 			snap, err = lt.TestOp(Update).RunStep(project, p.GetTarget(t, snap), lt.TestUpdateOptions{
@@ -4391,7 +4393,7 @@ func TestUntargetedProviderChange(t *testing.T) {
 		return nil
 	})
 
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 	options := lt.TestUpdateOptions{T: t, HostF: hostF}
 	p := &lt.TestPlan{}
 
@@ -4476,7 +4478,7 @@ func TestUntargetedAliasedProviderChanges(t *testing.T) {
 		return nil
 	})
 
-	setupHostF := deploytest.NewPluginHostF(nil, nil, setupProgramF, loaders...)
+	setupHostF := deploytest.NewPluginHostF(nil, nil, setupProgramF, nil, nil, loaders...)
 	setupOptions := lt.TestUpdateOptions{T: t, HostF: setupHostF}
 
 	setupSnap, err := lt.TestOp(Update).
@@ -4511,7 +4513,7 @@ func TestUntargetedAliasedProviderChanges(t *testing.T) {
 	// Run a targeted update that does not target any resources. Since providers are implicitly targeted, and since we
 	// gave Prov an alias, it should be renamed to its new URN (and subsequently, the set of resources that we didn't
 	// target should have their provider references updated to reflect the new URN).
-	reproHostF := deploytest.NewPluginHostF(nil, nil, reproProgramF, loaders...)
+	reproHostF := deploytest.NewPluginHostF(nil, nil, reproProgramF, nil, nil, loaders...)
 	reproOptions := lt.TestUpdateOptions{
 		T:     t,
 		HostF: reproHostF,
@@ -4579,7 +4581,7 @@ func TestUntargetedSameStepsAcceptDeletedResources(t *testing.T) {
 		return nil
 	})
 
-	hostF1 := deploytest.NewPluginHostF(nil, nil, programF1, loaders1...)
+	hostF1 := deploytest.NewPluginHostF(nil, nil, programF1, nil, nil, loaders1...)
 	opts1 := lt.TestUpdateOptions{T: t, HostF: hostF1}
 
 	snap1, err := lt.TestOp(Update).
@@ -4665,7 +4667,7 @@ func TestUntargetedSameStepsAcceptDeletedResources(t *testing.T) {
 		return nil
 	})
 
-	hostF2 := deploytest.NewPluginHostF(nil, nil, programF2, loaders2...)
+	hostF2 := deploytest.NewPluginHostF(nil, nil, programF2, nil, nil, loaders2...)
 	opts2 := lt.TestUpdateOptions{
 		T:     t,
 		HostF: hostF2,
@@ -4713,7 +4715,7 @@ func TestUntargetedSameStepsAcceptDeletedResources(t *testing.T) {
 		return nil
 	})
 
-	hostF3 := deploytest.NewPluginHostF(nil, nil, programF3, loaders3...)
+	hostF3 := deploytest.NewPluginHostF(nil, nil, programF3, nil, nil, loaders3...)
 	opts3 := lt.TestUpdateOptions{
 		T:     t,
 		HostF: hostF3,
@@ -4785,7 +4787,7 @@ func TestUntargetedResourceAnalyzer(t *testing.T) {
 		return nil
 	})
 
-	host := deploytest.NewPluginHostF(nil, nil, program, loaders...)
+	host := deploytest.NewPluginHostF(nil, nil, program, nil, nil, loaders...)
 	opts := lt.TestUpdateOptions{
 		T:     t,
 		HostF: host,
@@ -4884,7 +4886,7 @@ func TestUntargetedRefreshedProviderUpdate(t *testing.T) {
 		return nil
 	})
 
-	host := deploytest.NewPluginHostF(nil, nil, program, loaders...)
+	host := deploytest.NewPluginHostF(nil, nil, program, nil, nil, loaders...)
 	opts := lt.TestUpdateOptions{
 		T:     t,
 		HostF: host,

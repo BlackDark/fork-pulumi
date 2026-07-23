@@ -15,6 +15,7 @@
 package neo
 
 import (
+	"encoding/json"
 	"sort"
 	"strings"
 	"time"
@@ -37,6 +38,12 @@ import (
 // the second press still has to be deliberate but the gate doesn't silently
 // linger across long idle periods.
 const ctrlCArmTimeout = 1500 * time.Millisecond
+
+// minUsableTUIWidth is the floor below which a startup WindowSizeMsg is more
+// likely to be a transient terminal initialization artifact than a useful
+// interactive viewport. Rendering the input at those widths leaves only "Se"
+// from the placeholder in large terminals until the next resize.
+const minUsableTUIWidth = 40
 
 // ctrlCDisarmMsg is the deferred disarm signal scheduled when the user first
 // presses Ctrl+C. It carries the generation it was scheduled under; the
@@ -69,9 +76,13 @@ type permissionDebounceTickMsg struct {
 // tea.Println until after bubbletea v2's first renderer flush. Calling
 // Println inside the WindowSizeMsg handler runs while cellbuf is still
 // sized to the terminal, so insertAbove would scroll a screenful of blank
-// lines above the prompt.
+// lines above the prompt. rendered is the whole flush pre-joined into one
+// string so it can be emitted as a single, atomic Println — Update returns
+// its cmds via tea.Batch, which runs them concurrently, so per-block
+// Printlns would race each other (and any event-driven print) for
+// scrollback order.
 type firstFlushReadyMsg struct {
-	rendered []string
+	rendered string
 }
 
 // blockKind identifies the type of rendered block in the output log.
@@ -193,6 +204,17 @@ type ModelConfig struct {
 	// that want to exercise the post-task Ctrl+A / Ctrl+R path without driving
 	// a UISessionURL through the event channel.
 	TaskCreated bool
+	// History seeds the transcript for a resumed session. These events are
+	// applied before the first render so long histories do not flow through the
+	// bounded live EventCh.
+	History []UIEvent
+	// InitialWidth seeds the first render before Bubble Tea sends WindowSizeMsg.
+	// It is also used as a guard against bogus tiny startup resize events.
+	InitialWidth int
+	// HasDarkBackground selects light- or dark-friendly style variants for the
+	// whole TUI, including the textarea. runNeo detects it synchronously before
+	// the program starts and defaults it to dark for terminals it can't probe.
+	HasDarkBackground bool
 }
 
 // Model is the top-level bubbletea model for the Neo TUI.
@@ -230,6 +252,9 @@ type Model struct {
 	mdRenderer *glamour.TermRenderer
 	width      int
 	height     int
+	// hasDarkBackground selects light- or dark-friendly style variants;
+	// seeded from ModelConfig.HasDarkBackground.
+	hasDarkBackground bool
 	// frame advances on each spinner.TickMsg while busy and drives the
 	// shimmer animation on the busy block's label.
 	frame             int
@@ -311,6 +336,19 @@ type Model struct {
 	toolHistory   []toolCallRecord
 	overlayActive bool
 	overlay       overlayModel
+	// history holds the prompts the user has submitted this session, oldest
+	// first, recalled with the up/down arrows. There is intentionally no
+	// footer hint for it — the affordance mirrors shell history and is
+	// meant to be discovered by muscle memory.
+	history []string
+	// historyIdx is the cursor into history during up/down navigation. It
+	// equals len(history) when not navigating, i.e. the user is editing the
+	// live draft; stepping back with Up walks it down toward the oldest entry.
+	historyIdx int
+	// historyDraft stashes the in-progress draft when history navigation
+	// begins, so pressing Down past the newest entry restores what the user
+	// had typed rather than leaving a recalled prompt behind.
+	historyDraft string
 }
 
 var (
@@ -321,8 +359,6 @@ var (
 	cancelledStyle = lipgloss.NewStyle().Faint(true)
 	toolOKMarker   = lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Render("⏺")
 	toolErrMarker  = lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Render("⏺")
-	finalMarker    = lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Render("⏺")
-	userMsgBubble  = lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Background(lipgloss.Color("8"))
 	// planAccentStyle is a distinct cyan+bold used for both the footer banner
 	// and the "Proposed plan" block header so they read as the same visual cue.
 	planAccentStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true)
@@ -332,6 +368,11 @@ var (
 	todoCompletedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Faint(true)
 	todoListHeader     = lipgloss.NewStyle().Bold(true).Render("⏺ TODO")
 )
+
+func placeholderStyle(hasDarkBackground bool) lipgloss.Style {
+	return lipgloss.NewStyle().Foreground(
+		lipgloss.LightDark(hasDarkBackground)(lipgloss.Color("240"), lipgloss.Color("245")))
+}
 
 // renderLeftBracket decorates content with a left-only bracket border: a
 // "╭─" tick above the first content line, a "│ " prefix on every content
@@ -383,6 +424,79 @@ func nextPermissionMode(m client.NeoPermissionMode) client.NeoPermissionMode {
 	return client.NeoPermissionModeReadOnly
 }
 
+// recallInput replaces the textarea contents with a recalled prompt and parks
+// the cursor at the end, ready to edit or resend.
+func (m *Model) recallInput(s string) {
+	m.textInput.SetValue(s)
+	m.textInput.MoveToEnd()
+}
+
+func addKeyAliases(binding *key.Binding, aliases ...string) {
+	binding.SetKeys(append(binding.Keys(), aliases...)...)
+}
+
+func (m Model) draftEditingKey(msg tea.KeyPressMsg) bool {
+	if m.textInput.Value() == "" {
+		return false
+	}
+
+	km := m.textInput.KeyMap
+	return key.Matches(msg,
+		km.CharacterBackward,
+		km.CharacterForward,
+		km.DeleteAfterCursor,
+		km.DeleteBeforeCursor,
+		km.DeleteCharacterBackward,
+		km.DeleteCharacterForward,
+		km.DeleteWordBackward,
+		km.DeleteWordForward,
+		km.LineEnd,
+		km.LineStart,
+		km.InputBegin,
+		km.InputEnd,
+		km.WordBackward,
+		km.WordForward,
+		km.CapitalizeWordForward,
+		km.LowercaseWordForward,
+		km.UppercaseWordForward,
+		km.TransposeCharacterBackward,
+	)
+}
+
+// historyPrev steps to an older prompt. It returns true when it handled the
+// key (so the caller swallows it). The first step out of the live draft
+// stashes that draft in historyDraft so a later Down can restore it.
+func (m *Model) historyPrev() bool {
+	if len(m.history) == 0 {
+		return false
+	}
+	if m.historyIdx == 0 {
+		return true // already at the oldest entry; pin here
+	}
+	if m.historyIdx == len(m.history) {
+		m.historyDraft = m.textInput.Value()
+	}
+	m.historyIdx--
+	m.recallInput(m.history[m.historyIdx])
+	return true
+}
+
+// historyNext steps toward newer prompts; past the newest it restores the
+// saved draft. It returns false when not currently navigating so Down falls
+// through to the textarea's own cursor movement.
+func (m *Model) historyNext() bool {
+	if m.historyIdx >= len(m.history) {
+		return false
+	}
+	m.historyIdx++
+	if m.historyIdx == len(m.history) {
+		m.recallInput(m.historyDraft)
+	} else {
+		m.recallInput(m.history[m.historyIdx])
+	}
+	return true
+}
+
 // renderIndented word-wraps content (ANSI-safe) to termWidth minus the
 // 2-space transcript gutter, or returns un-wrapped if the width is too
 // small to wrap into. URLs in the post-wrap output are wrapped in OSC 8
@@ -398,6 +512,12 @@ func renderIndented(style lipgloss.Style, termWidth int, content string) string 
 
 // NewModel creates a new TUI Model.
 func NewModel(cfg ModelConfig) Model {
+	initialWidth := cfg.InitialWidth
+	if initialWidth <= 0 {
+		initialWidth = 80
+	}
+	initialHeight := 24
+
 	ti := textarea.New()
 	ti.Placeholder = "Send a message..."
 	ti.CharLimit = 4096
@@ -422,9 +542,14 @@ func NewModel(cfg ModelConfig) Model {
 		}
 		return "  "
 	})
-	styles := ti.Styles()
+	// textarea.New defaults to dark styles; reselect for the detected background
+	// so the input box (cursor line, text) reads on a light terminal too.
+	styles := textarea.DefaultStyles(cfg.HasDarkBackground)
 	styles.Focused.Prompt = promptStyle
 	styles.Blurred.Prompt = promptStyle
+	placeholder := placeholderStyle(cfg.HasDarkBackground)
+	styles.Focused.Placeholder = placeholder
+	styles.Blurred.Placeholder = placeholder
 	ti.SetStyles(styles)
 	// Keep Enter as submit. Shift+Enter / Alt+Enter need kitty keyboard
 	// protocol; Ctrl+J (== LF) is the portable fallback. Trailing backslash
@@ -433,6 +558,9 @@ func NewModel(cfg ModelConfig) Model {
 		key.WithKeys("shift+enter", "alt+enter", "ctrl+j"),
 		key.WithHelp("shift+enter / alt+enter / ctrl+j", "newline"),
 	)
+	addKeyAliases(&ti.KeyMap.WordForward, "meta+f")
+	addKeyAliases(&ti.KeyMap.WordBackward, "meta+b")
+	addKeyAliases(&ti.KeyMap.DeleteWordBackward, "meta+backspace", "super+backspace")
 	ti.Focus()
 
 	sp := spinner.New(
@@ -446,28 +574,36 @@ func NewModel(cfg ModelConfig) Model {
 			workDir:   cfg.WorkDir,
 			username:  cfg.Username,
 			version:   cfg.Version,
-			termWidth: 80,
+			termWidth: initialWidth,
 			greeting:  pickGreeting(cfg.Username),
 		},
-		textInput:      ti,
-		eventCh:        cfg.EventCh,
-		outCh:          cfg.OutCh,
-		busy:           cfg.Busy,
-		spinner:        sp,
-		width:          80,
-		height:         24,
-		messageSent:    cfg.MessageSent,
-		taskCreated:    cfg.TaskCreated,
-		approvalMode:   cfg.InitialApprovalMode,
-		permissionMode: cfg.InitialPermissionMode,
-		overlay:        newOverlayModel(80, 24),
+		textInput:         ti,
+		eventCh:           cfg.EventCh,
+		outCh:             cfg.OutCh,
+		busy:              cfg.Busy,
+		spinner:           sp,
+		width:             initialWidth,
+		height:            initialHeight,
+		hasDarkBackground: cfg.HasDarkBackground,
+		messageSent:       cfg.MessageSent,
+		taskCreated:       cfg.TaskCreated,
+		approvalMode:      cfg.InitialApprovalMode,
+		permissionMode:    cfg.InitialPermissionMode,
+		overlay:           newOverlayModel(initialWidth, initialHeight),
 	}
+	m.textInput.SetWidth(max(m.liveWidth(), 3))
 	if cfg.InitialPrompt != "" {
 		// Render the initial-prompt block now so tests can find it via
 		// findBlockKind. The actual scrollback emission happens on the first
-		// WindowSizeMsg, when we have the real terminal width.
-		m.appendUserMessageBlock(cfg.InitialPrompt)
+		// WindowSizeMsg, when we have the real terminal width. Seed the block
+		// directly rather than via commitBlock: its printlnBlock side effect
+		// would flip hasEmittedScrollback before anything is actually printed,
+		// giving the welcome banner a stray leading blank line.
+		m.stageBlock(block{kind: blockUserMessage, raw: cfg.InitialPrompt})
 		m.pendingUserEchoes = append(m.pendingUserEchoes, cfg.InitialPrompt)
+	}
+	for _, event := range cfg.History {
+		m.applyHistoryEvent(event)
 	}
 	if cfg.Busy {
 		m.blocks = append(m.blocks, block{
@@ -495,8 +631,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		firstSize := !m.sizeReceived
 		m.sizeReceived = true
-		m.width = msg.Width
-		m.height = msg.Height
+		width := msg.Width
+		if firstSize && width < minUsableTUIWidth && m.width >= minUsableTUIWidth {
+			width = m.width
+		}
+		height := msg.Height
+		if height <= 0 {
+			height = m.height
+		}
+		m.width = width
+		m.height = height
 		safeWidth := m.liveWidth()
 		m.welcome.termWidth = safeWidth
 		// SetWidth accounts for the prompt width registered via SetPromptFunc.
@@ -506,15 +650,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.overlay.Refresh(m.toolHistory)
 		}
 
-		// Glamour's wrap width is baked in at construction, so rebuild on resize.
-		// Wrap at liveWidth-4 so glamour-rendered output (assistant finals, plan
-		// markdown) stays inside the safe live-frame width.
-		if r, err := glamour.NewTermRenderer(
-			glamour.WithStylePath("dark"),
-			glamour.WithWordWrap(safeWidth-4),
-		); err == nil {
-			m.mdRenderer = r
-		}
+		m.rebuildMarkdownRenderer()
 		// Re-render every block at the new width. Live blocks (busy / streaming /
 		// open pulumi op) get reflected in View() on the next draw; committed
 		// blocks already in scrollback don't reflow — only the initial-prompt
@@ -524,12 +660,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.renderBlock(&m.blocks[i])
 		}
 		if firstSize {
-			rendered := []string{m.welcome.View()}
-			for _, b := range m.blocks {
-				if isCommittedKind(b) && b.rendered != "" {
-					rendered = append(rendered, b.rendered)
-				}
-			}
+			rendered := m.committedScrollback()
 			// 50ms covers ~3 ticks at bubbletea's 60Hz default — see
 			// firstFlushReadyMsg for why we defer at all.
 			cmds = append(cmds, tea.Tick(50*time.Millisecond, func(time.Time) tea.Msg {
@@ -538,9 +669,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case firstFlushReadyMsg:
-		for _, r := range msg.rendered {
-			cmds = append(cmds, m.printlnBlock(r))
-		}
+		cmds = append(cmds, m.printlnBlock(msg.rendered))
+
+	case tea.ResumeMsg:
+		// Resuming from a Ctrl+Z suspend (via `fg`): bubbletea repaints only the
+		// live frame, but the committed transcript was emitted to scrollback via
+		// tea.Println and isn't redrawn. Clear the viewport and re-emit the
+		// committed transcript so the session reads continuously after `fg`.
+		// Reset hasEmittedScrollback so the re-emit skips its leading blank
+		// line, matching the initial flush. Sequence keeps the clear ahead of
+		// the print.
+		m.hasEmittedScrollback = false
+		return m, tea.Sequence(tea.ClearScreen, m.printlnBlock(m.committedScrollback()))
 
 	case ctrlCDisarmMsg:
 		// Stale tick: the user already pressed another key (gen still
@@ -593,9 +733,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		}
-		// Ctrl+D mirrors Ctrl+C: same arm/quit gate, same cancel-when-busy
-		// semantics. Two bindings is friendlier than picking one and forcing
-		// users to discover it.
+		// Ctrl+C clears an in-progress draft first, matching the normal line
+		// editing behavior users expect from agent CLIs. With an empty draft,
+		// it falls through to the quit/cancel gate below.
+		if keyStr == "ctrl+c" && m.textInput.Value() != "" {
+			m.textInput.Reset()
+			return m, nil
+		}
+
+		// When the user is editing a draft, let textarea keep ownership of its
+		// line-editing keymap before app-level shortcuts see the same key.
+		if m.draftEditingKey(msg) {
+			var tiCmd tea.Cmd
+			m.textInput, tiCmd = m.textInput.Update(msg)
+			return m, tiCmd
+		}
+
+		// Ctrl+D mirrors Ctrl+C when the draft is empty: same arm/quit gate,
+		// same cancel-when-busy semantics. Two bindings is friendlier than
+		// picking one and forcing users to discover it.
 		if keyStr == "ctrl+c" || keyStr == "ctrl+d" {
 			if m.ctrlCArmed {
 				return m, tea.Quit
@@ -619,6 +775,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// presses goes back to needing two presses again. The pending tick
 		// will fire later but no-op because ctrlCArmed is already false.
 		m.ctrlCArmed = false
+
+		// Ctrl+Z suspends via standard Unix job control (SIGTSTP); resume with
+		// `fg`. Bubbletea restores the terminal around the stop, so raw mode is
+		// fine. Not gated on busy — suspending mid-turn is the point, since
+		// cancellation isn't instant.
+		if keyStr == "ctrl+z" {
+			return m, tea.Suspend
+		}
 
 		// Ctrl+O opens the overlay. Sits above the busy/approval gates so
 		// users can peek mid-turn. Closing is handled by the overlayActive
@@ -725,8 +889,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					answerCmd := m.commitBlock(block{kind: blockAnswerSubmitted, raw: text})
 					return m, tea.Batch(answerCmd, m.showBusy(thinkingLabel, shimmerVerb))
 				}
-				approved := strings.EqualFold(text, "y") || strings.EqualFold(text, "yes")
-				var denialMsg string
+				approved := isAffirmative(text)
+				denialMsg := ""
 				if !approved {
 					denialMsg = text
 				}
@@ -804,6 +968,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// UIUserMessage handler to avoid duplicates.
 					userCmd := m.appendUserMessageBlock(text)
 					m.pendingUserEchoes = append(m.pendingUserEchoes, text)
+					// Record the prompt for up/down history recall. Skip a
+					// consecutive duplicate so mashing the same message
+					// doesn't bloat the history.
+					if n := len(m.history); n == 0 || m.history[n-1] != text {
+						m.history = append(m.history, text)
+					}
+					m.historyIdx = len(m.history)
+					m.historyDraft = ""
 					// Freeze the plan-mode affordance: planMode has now been
 					// committed to the dispatcher and any later Shift+Tab
 					// would be a no-op on the server.
@@ -812,6 +984,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			return m, nil
+		}
+
+		// Up/Down recall prompt history when the cursor sits on the edge line
+		// of the input — mirroring shell history. Mid-buffer they fall through
+		// to the textarea's line movement. No footer hint is shown, by design.
+		if keyStr == "up" && m.textInput.Line() == 0 {
+			if m.historyPrev() {
+				return m, nil
+			}
+		}
+		if keyStr == "down" && m.textInput.Line() == m.textInput.LineCount()-1 {
+			if m.historyNext() {
+				return m, nil
+			}
 		}
 
 		// Pass to text input for typing. The terminal's own scrollback is
@@ -856,14 +1042,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.overlayActive {
 			m.overlay.Refresh(m.toolHistory)
 		}
-		marker := toolOKMarker
-		if msg.IsError {
-			marker = toolErrMarker
-		}
-		cmds = append(cmds, m.commitBlock(block{
-			kind:     blockToolComplete,
-			rendered: "  " + marker + " " + styledToolLabel(msg.Name, msg.Args),
-		}))
+		cmds = append(cmds, m.commitBlock(toolCompletedBlock(msg.Name, msg.Args, msg.IsError)))
 		// Keep the busy block alive across the inter-tool gap so the spinner
 		// stays visible while the agent decides its next move.
 		cmds = append(cmds, m.applyBusyForEvent(msg))
@@ -877,6 +1056,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case UIWarning:
 		cmds = append(cmds, m.applyBusyForEvent(msg))
 		cmds = append(cmds, m.appendWarningBlock(msg.Message))
+		cmds = append(cmds, waitForEvent(m.eventCh))
+
+	case UIReconnecting:
+		cmds = append(cmds, m.applyBusyForEvent(msg))
+		cmds = append(cmds, waitForEvent(m.eventCh))
+
+	case UIReconnected:
+		cmds = append(cmds, m.applyBusyForEvent(msg))
 		cmds = append(cmds, waitForEvent(m.eventCh))
 
 	case UICancelled:
@@ -1105,8 +1292,22 @@ func (m Model) viewString() string {
 	if m.approvalPromptText != "" {
 		parts = append(parts, "  "+m.approvalPromptText)
 	}
-	parts = append(parts, m.textInput.View(), hint)
+	parts = append(parts, m.inputView(), hint)
 	return strings.Join(parts, "\n")
+}
+
+func (m Model) inputView() string {
+	ti := m.textInput
+	ti.SetWidth(max(m.liveWidth(), 3))
+	return ti.View()
+}
+
+func (m Model) prepareInitialScrollback(width, height int) (Model, string) {
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: width, Height: height})
+	prepared := updated.(Model)
+	rendered := prepared.committedScrollback()
+	prepared.hasEmittedScrollback = true
+	return prepared, rendered
 }
 
 // modeChips renders the status-bar chips for the three independent mode axes
@@ -1129,6 +1330,24 @@ func (m Model) modeChips() string {
 		chips = append(chips, planAccentStyle.Render("⊘ read-only"))
 	}
 	return strings.Join(chips, " ")
+}
+
+// rebuildMarkdownRenderer constructs a new glamour renderer at the current
+// live width and a style matching the terminal background. Glamour bakes both
+// in at construction, so callers rebuild on resize. We pick the style
+// explicitly rather than via glamour.WithAutoStyle, which queries the terminal
+// in-band and would race bubbletea's input reader (see runNeo).
+func (m *Model) rebuildMarkdownRenderer() {
+	style := "dark"
+	if !m.hasDarkBackground {
+		style = "light"
+	}
+	if r, err := glamour.NewTermRenderer(
+		glamour.WithStandardStyle(style),
+		glamour.WithWordWrap(m.liveWidth()-4),
+	); err == nil {
+		m.mdRenderer = r
+	}
 }
 
 // liveWidth returns the width to use when rendering live-frame content:
@@ -1163,7 +1382,7 @@ func (m *Model) liveView() string {
 			continue
 		}
 		if b.kind == blockBusy {
-			parts = append(parts, "  "+m.spinner.View()+" "+shimmerLabel(b.label, b.shimmer, m.frame))
+			parts = append(parts, "  "+m.spinner.View()+" "+shimmerLabel(b.label, b.shimmer, m.frame, m.hasDarkBackground))
 		} else {
 			parts = append(parts, b.rendered)
 		}
@@ -1198,6 +1417,147 @@ func isLiveKind(b block) bool {
 
 func isCommittedKind(b block) bool { return !isLiveKind(b) }
 
+func (m *Model) stageBlock(b block) {
+	m.renderBlock(&b)
+	m.appendBlock(b)
+}
+
+func (m *Model) applyHistoryEvent(ev UIEvent) {
+	switch msg := ev.(type) {
+	case UIAssistantMessage:
+		if msg.Content != "" {
+			m.stageBlock(block{kind: blockAssistantFinal, raw: msg.Content})
+		}
+		_ = m.applyBusyForEvent(msg)
+		m.clearStaleHistoryApproval(msg)
+	case UIToolStarted:
+		m.toolHistory = appendToolStart(m.toolHistory, msg.Name, msg.Args)
+		_ = m.applyBusyForEvent(msg)
+	case UIToolProgress:
+		_ = m.applyBusyForEvent(msg)
+	case UIToolCompleted:
+		completeToolCall(m.toolHistory, msg.Name, msg.Result, msg.IsError)
+		m.stageBlock(toolCompletedBlock(msg.Name, msg.Args, msg.IsError))
+		_ = m.applyBusyForEvent(msg)
+	case UIError:
+		_ = m.applyBusyForEvent(msg)
+		m.stageBlock(block{kind: blockError, raw: msg.Message})
+		m.clearStaleHistoryApproval(msg)
+	case UIWarning:
+		_ = m.applyBusyForEvent(msg)
+		m.stageBlock(block{kind: blockWarning, raw: msg.Message})
+	case UIReconnecting, UIReconnected, UIAwaitingApprovals, UIContextCompression:
+		_ = m.applyBusyForEvent(msg)
+	case UICancelled:
+		_ = m.applyBusyForEvent(msg)
+		m.stageBlock(block{kind: blockCancelled, raw: "Session cancelled."})
+		m.clearStaleHistoryApproval(msg)
+	case UITaskIdle:
+		_ = m.applyBusyForEvent(msg)
+		m.clearStaleHistoryApproval(msg)
+	case UISessionURL:
+		m.welcome.consoleURL = msg.URL
+		m.taskCreated = true
+	case UIUserMessage:
+		m.stageBlock(block{kind: blockUserMessage, raw: msg.Content})
+		_ = m.applyBusyForEvent(msg)
+	case UIApprovalRequest:
+		_ = m.applyBusyForEvent(msg)
+		m.pendingApproval = true
+		m.pendingApprovalID = msg.ApprovalID
+		m.pendingApprovalType = msg.ApprovalType
+		m.pendingIsQuestion = false
+		m.textInput.Placeholder = ""
+		m.textInput.Reset()
+		switch {
+		case m.pendingApprovalType == approvalTypePlanExit:
+			m.stageBlock(block{kind: blockApprovalPlan, raw: msg.PlanDescription, todos: m.pendingTodos})
+			m.pendingTodos = nil
+			m.approvalPromptText = warningStyle.Render("Approve plan? [y to approve / reason to deny]:")
+		case isAskUserToolName(msg.ToolName):
+			m.pendingIsQuestion = true
+			m.stageBlock(block{kind: blockQuestion, raw: msg.Message})
+			m.approvalPromptText = promptStyle.Render("Your answer:")
+		default:
+			m.stageBlock(block{kind: blockApprovalGeneral, raw: msg.Message})
+			m.approvalPromptText = warningStyle.Render("Approve? [y to approve / reason to deny]:")
+		}
+	case UIApprovalResolved:
+		if m.pendingApproval && msg.ApprovalID == m.pendingApprovalID {
+			m.stageBlock(block{
+				kind:           blockApprovalAuto,
+				approved:       msg.Approved,
+				autoIsQuestion: m.pendingIsQuestion,
+			})
+			m.clearPendingPrompt()
+		}
+	case UIPulumiStart:
+		if idx := m.findOpenPulumiBlock(msg.ToolName); idx < 0 {
+			m.stageBlock(block{kind: blockPulumiOp, pulumi: &pulumiBlockState{
+				toolName:      msg.ToolName,
+				stackName:     msg.StackName,
+				isPreview:     msg.IsPreview,
+				resourceByURN: map[string]int{},
+			}})
+		}
+		_ = m.applyBusyForEvent(msg)
+	case UIPulumiResource:
+		if idx := m.findOpenPulumiBlock(msg.ToolName); idx >= 0 {
+			m.blocks[idx].pulumi.addResource(msg.Op, msg.URN, msg.Type, msg.Status)
+			m.renderBlock(&m.blocks[idx])
+		}
+		_ = m.applyBusyForEvent(msg)
+	case UIPulumiDiag:
+		if idx := m.findOpenPulumiBlock(msg.ToolName); idx >= 0 {
+			st := m.blocks[idx].pulumi
+			st.diags = append(st.diags, pulumiDiagRow{
+				severity: msg.Severity,
+				message:  msg.Message,
+				urn:      msg.URN,
+			})
+			m.renderBlock(&m.blocks[idx])
+		}
+		_ = m.applyBusyForEvent(msg)
+	case UIPulumiEnd:
+		if idx := m.findOpenPulumiBlock(msg.ToolName); idx >= 0 {
+			st := m.blocks[idx].pulumi
+			st.counts = msg.Counts
+			st.elapsed = msg.Elapsed
+			st.err = msg.Err
+			st.done = true
+			m.renderBlock(&m.blocks[idx])
+		}
+		_ = m.applyBusyForEvent(msg)
+	case UITodoList:
+		if len(msg.Items) > 0 {
+			if m.planMode {
+				m.pendingTodos = msg.Items
+			} else {
+				m.stageBlock(block{kind: blockTodoList, todos: msg.Items})
+			}
+		}
+		_ = m.applyBusyForEvent(msg)
+	}
+}
+
+func toolCompletedBlock(name string, args json.RawMessage, isError bool) block {
+	marker := toolOKMarker
+	if isError {
+		marker = toolErrMarker
+	}
+	return block{
+		kind:     blockToolComplete,
+		rendered: "  " + marker + " " + styledToolLabel(name, args),
+	}
+}
+
+func (m *Model) clearStaleHistoryApproval(ev UIEvent) {
+	if !m.pendingApproval || !isFinalUIEvent(ev) {
+		return
+	}
+	m.clearPendingPrompt()
+}
+
 // commitBlock renders b, appends it to m.blocks, and returns a tea.Cmd that
 // prints the rendered string as new terminal scrollback. Returns nil when the
 // block renders empty (e.g. an empty assistant final from a hand-off).
@@ -1208,6 +1568,22 @@ func (m *Model) commitBlock(b block) tea.Cmd {
 		return nil
 	}
 	return m.printlnBlock(b.rendered)
+}
+
+// committedScrollback returns the welcome banner followed by every committed
+// block's rendered text, in transcript order, joined with the same blank-line
+// separator printlnBlock puts between incremental prints — i.e. everything
+// that belongs in terminal scrollback, as one string ready for a single
+// atomic tea.Println. Used for the initial flush and to re-emit the
+// transcript after a suspend/resume.
+func (m Model) committedScrollback() string {
+	out := []string{m.welcome.View()}
+	for _, b := range m.blocks {
+		if isCommittedKind(b) && b.rendered != "" {
+			out = append(out, b.rendered)
+		}
+	}
+	return strings.Join(out, "\n\n")
 }
 
 // printlnBlock emits rendered to scrollback, prepending a blank line so each
@@ -1280,6 +1656,10 @@ func (m *Model) labelForUIEvent(ev UIEvent) (string, shimmerKind, bool) {
 		return "Awaiting approvals...", shimmerVerb, true
 	case UIContextCompression:
 		return "Compressing context...", shimmerVerb, true
+	case UIReconnecting:
+		return "Reconnecting...", shimmerVerb, true
+	case UIReconnected:
+		return thinkingLabel, shimmerVerb, true
 	}
 	return "", 0, false
 }
@@ -1436,9 +1816,9 @@ func (m *Model) renderBlock(b *block) {
 	case blockCancelled:
 		b.rendered = renderIndented(cancelledStyle, m.width, b.raw)
 	case blockUserMessage:
-		b.rendered = m.renderUserBubble(b.raw)
+		b.rendered = m.renderUserMessage(b.raw)
 	case blockAssistantFinal:
-		b.rendered = renderAssistantFinal(m.renderMarkdown(b.raw))
+		b.rendered = m.renderAssistantFinal(m.renderMarkdown(b.raw))
 	case blockApprovalPlan:
 		header := planAccentStyle.Render("⏺ Proposed plan")
 		body := m.renderMarkdown(b.raw)
@@ -1522,18 +1902,25 @@ func (m *Model) renderApprovalChoice(b *block) {
 	b.rendered = renderIndented(lipgloss.NewStyle(), m.width, denied+" — "+b.raw)
 }
 
-// renderUserBubble renders a user-chat bubble. Short messages hug their
-// content; only overflow triggers Width, which both wraps and pads so the
-// background colour fills every wrapped line evenly.
-func (m *Model) renderUserBubble(content string) string {
+// renderUserMessage renders an echoed user message: the cyan-bold ❯ prefix
+// marks it as user input, the content renders plain so it reads on any
+// background. Continuation lines indent two spaces so they sit under the
+// message body, not under the prompt glyph.
+func (m *Model) renderUserMessage(content string) string {
 	prefix := promptStyle.Render("❯") + " " // visible width 2
-	padded := " " + content + " "
-	bubbleWidth := max(m.liveWidth()-2, 8)
-	style := userMsgBubble
-	if m.width > 4 && lipgloss.Width(padded) > bubbleWidth {
-		style = style.Width(bubbleWidth)
+	wrap := m.liveWidth() - 2
+	if wrap < 4 {
+		return prefix + content
 	}
-	return prefix + style.Render(padded)
+	lines := strings.Split(wordwrap.String(content, wrap), "\n")
+	var sb strings.Builder
+	sb.WriteString(prefix)
+	sb.WriteString(lines[0])
+	for _, line := range lines[1:] {
+		sb.WriteString("\n  ")
+		sb.WriteString(line)
+	}
+	return sb.String()
 }
 
 // wrapPlain word-wraps non-markdown text to the safe live width (m.liveWidth)
@@ -1577,14 +1964,21 @@ func renderHeaderedBlock(header, body string) string {
 	return lipgloss.JoinVertical(lipgloss.Left, first, indented)
 }
 
-// renderAssistantFinal renders a final assistant message with a white circle marker.
-func renderAssistantFinal(rendered string) string {
+// finalMarker returns the ⏺ glyph for a final assistant message, colored
+// to contrast with the terminal background (white on dark, black on light).
+func (m *Model) finalMarker() string {
+	fg := lipgloss.LightDark(m.hasDarkBackground)(lipgloss.Color("0"), lipgloss.Color("15"))
+	return lipgloss.NewStyle().Foreground(fg).Render("⏺")
+}
+
+// renderAssistantFinal renders a final assistant message with a circle marker.
+func (m *Model) renderAssistantFinal(rendered string) string {
 	trimmed := strings.TrimLeft(rendered, "\n ")
 	if trimmed == "" {
 		return ""
 	}
 	firstLine, rest, _ := strings.Cut(trimmed, "\n")
-	return renderHeaderedBlock(finalMarker+" "+firstLine, rest)
+	return renderHeaderedBlock(m.finalMarker()+" "+firstLine, rest)
 }
 
 // waitForEvent returns a tea.Cmd that reads from the UIEvent channel.

@@ -21,20 +21,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"text/template"
 
 	"github.com/charmbracelet/glamour"
-	"github.com/pulumi/esc"
-	"github.com/pulumi/esc/eval"
 	"github.com/pulumi/pulumi/pkg/v3/backend"
 	"github.com/pulumi/pulumi/pkg/v3/backend/backenderr"
 	"github.com/pulumi/pulumi/pkg/v3/backend/display"
 	cmdBackend "github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/backend"
 	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/constrictor"
 	cmdStack "github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/stack"
-	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/ui"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/esc"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/esc/eval"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/cmdutil"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
@@ -65,16 +65,20 @@ func newConfigEnvInitCmd(parent *configEnvCmd) *cobra.Command {
 
 	cmd.Flags().StringVar(
 		&impl.envName, "env", "",
-		`The name of the environment to create. Defaults to "<project name>/<stack name>"`)
+		`The name of the environment to create. Defaults to "<project name>/<stack name>"`,
+	)
 	cmd.Flags().BoolVar(
 		&impl.showSecrets, "show-secrets", false,
-		"Show secret values in plaintext instead of ciphertext")
+		"Show secret values in plaintext instead of ciphertext",
+	)
 	cmd.Flags().BoolVar(
 		&impl.keepConfig, "keep-config", false,
-		"Do not remove configuration values from the stack after creating the environment")
+		"Do not remove configuration values from the stack after creating the environment",
+	)
 	cmd.Flags().BoolVarP(
 		&impl.yes, "yes", "y", false,
-		"True to save the created environment without prompting")
+		"True to save the created environment without prompting",
+	)
 
 	return cmd
 }
@@ -106,7 +110,12 @@ func (cmd *configEnvInitCmd) run(ctx context.Context, args []string) error {
 
 	opts := display.Options{Color: cmd.parent.color}
 
-	project, _, err := cmd.parent.ws.ReadProject()
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("getting current working directory: %w", err)
+	}
+
+	project, _, err := cmd.parent.ws.ReadProject(cwd)
 	if err != nil {
 		return err
 	}
@@ -119,6 +128,7 @@ func (cmd *configEnvInitCmd) run(ctx context.Context, args []string) error {
 		*cmd.parent.stackRef,
 		cmdStack.OfferNew|cmdStack.SetCurrent,
 		opts,
+		*cmd.parent.configFile,
 	)
 	if err != nil {
 		return err
@@ -126,7 +136,7 @@ func (cmd *configEnvInitCmd) run(ctx context.Context, args []string) error {
 
 	envBackend, ok := stack.Backend().(backend.EnvironmentsBackend)
 	if !ok {
-		return fmt.Errorf("backend %v does not support environments", stack.Backend().Name())
+		return errBackendNoEnvironments(stack.Backend())
 	}
 
 	orgName := stack.(interface{ OrgName() string }).OrgName()
@@ -168,7 +178,7 @@ func (cmd *configEnvInitCmd) run(ctx context.Context, args []string) error {
 	fmt.Fprint(cmd.parent.stdout, preview)
 
 	if !cmd.yes {
-		response := ui.PromptUser("Save?", []string{"yes", "no"}, "yes", cmdutil.GetGlobalColorization())
+		response := cmd.parent.prompt("Save?", []string{"yes", "no"}, "yes", cmdutil.GetGlobalColorization())
 		switch response {
 		case "no":
 			return errors.New("canceled")
@@ -196,7 +206,7 @@ func (cmd *configEnvInitCmd) run(ctx context.Context, args []string) error {
 	if !cmd.keepConfig {
 		projectStack.Config = nil
 	}
-	if err = cmd.parent.saveProjectStack(ctx, stack, projectStack); err != nil {
+	if err = cmd.parent.saveProjectStack(ctx, stack, projectStack, *cmd.parent.configFile); err != nil {
 		return fmt.Errorf("saving stack config: %w", err)
 	}
 	return nil
@@ -208,7 +218,7 @@ func (cmd *configEnvInitCmd) getStackConfig(
 	project *workspace.Project,
 	stack backend.Stack,
 ) (*workspace.ProjectStack, property.Map, error) {
-	ps, err := cmd.parent.loadProjectStack(ctx, sink, project, stack)
+	ps, err := cmd.parent.loadProjectStack(ctx, sink, project, stack, *cmd.parent.configFile)
 	if err != nil {
 		return nil, property.Map{}, err
 	}
@@ -219,7 +229,7 @@ func (cmd *configEnvInitCmd) getStackConfig(
 	}
 	// This may have setup the stack's secrets provider, so save the stack if needed.
 	if state != cmdStack.SecretsManagerUnchanged {
-		if err = cmd.parent.saveProjectStack(ctx, stack, ps); err != nil {
+		if err = cmd.parent.saveProjectStack(ctx, stack, ps, *cmd.parent.configFile); err != nil {
 			return nil, property.Map{}, fmt.Errorf("saving stack config: %w", err)
 		}
 	}

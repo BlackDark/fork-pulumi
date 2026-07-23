@@ -92,7 +92,7 @@ type stackOutputCmd struct {
 	// from tests.
 	requireStack func(
 		ctx context.Context, sink diag.Sink, ws pkgWorkspace.Context, lm cmdBackend.LoginManager,
-		name string, lopt LoadOption, opts display.Options,
+		name string, lopt LoadOption, opts display.Options, configFile string,
 	) (backend.Stack, error)
 
 	Stdout io.Writer // defaults to os.Stdout
@@ -139,11 +139,17 @@ func (cmd *stackOutputCmd) Run(ctx context.Context, args []string) error {
 		cmd.stackName,
 		LoadOnly,
 		opts,
+		"",
 	)
 	if err != nil {
 		return err
 	}
-	snapshotStackOutputs, err := s.SnapshotStackOutputs(ctx, secrets.DefaultProvider)
+	// When we're not showing secrets, use a blinding provider to prevent secrets from being disclosed.
+	secretsProvider := secrets.DefaultProvider
+	if !cmd.showSecrets {
+		secretsProvider = secrets.BlindingProvider
+	}
+	snapshotStackOutputs, err := s.SnapshotStackOutputs(ctx, secretsProvider)
 	if err != nil {
 		return err
 	}

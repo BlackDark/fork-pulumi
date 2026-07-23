@@ -19,6 +19,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"maps"
 	"os"
 	"regexp"
 	"runtime"
@@ -42,14 +43,15 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/engine"
 	. "github.com/pulumi/pulumi/pkg/v3/engine" //nolint:revive
 	lt "github.com/pulumi/pulumi/pkg/v3/engine/lifecycletest/framework"
+	pkgresource "github.com/pulumi/pulumi/pkg/v3/resource"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy/deploytest"
+	"github.com/pulumi/pulumi/pkg/v3/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag/colors"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/providers"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
@@ -169,11 +171,27 @@ func TestEmptyProgramLifecycle(t *testing.T) {
 	programF := deploytest.NewLanguageRuntimeF(func(_ plugin.RunInfo, _ *deploytest.ResourceMonitor) error {
 		return nil
 	})
-	hostF := deploytest.NewPluginHostF(nil, nil, programF)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil)
 
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
 		Steps:   lt.MakeBasicLifecycleSteps(t, 0),
+	}
+	p.Run(t, nil)
+}
+
+func TestNoRuntimeLifecycle(t *testing.T) {
+	t.Parallel()
+
+	programF := deploytest.NewLanguageRuntimeF(func(_ plugin.RunInfo, _ *deploytest.ResourceMonitor) error {
+		return errors.New("program should not run")
+	})
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil)
+
+	p := &lt.TestPlan{
+		NoRuntime: true,
+		Options:   lt.TestUpdateOptions{T: t, HostF: hostF},
+		Steps:     lt.MakeBasicLifecycleSteps(t, 0),
 	}
 	p.Run(t, nil)
 }
@@ -207,7 +225,7 @@ func TestSingleResourceDiffUnavailable(t *testing.T) {
 		require.NoError(t, err)
 		return nil
 	})
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
@@ -269,7 +287,7 @@ func TestCheckFailureRecord(t *testing.T) {
 		return err
 	})
 
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
 		Steps: []lt.TestStep{{
@@ -325,7 +343,7 @@ func TestCheckFailureInvalidPropertyRecord(t *testing.T) {
 		return err
 	})
 
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
 		Steps: []lt.TestStep{{
@@ -372,7 +390,7 @@ func TestLanguageHostDiagnostics(t *testing.T) {
 		return errors.New(errorText)
 	})
 
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
 		Steps: []lt.TestStep{{
@@ -429,7 +447,7 @@ func TestBrokenDecrypter(t *testing.T) {
 	programF := deploytest.NewLanguageRuntimeF(func(_ plugin.RunInfo, _ *deploytest.ResourceMonitor) error {
 		return nil
 	})
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 	key := config.MustMakeKey("foo", "bar")
 	msg := "decryption failed"
 	configMap := make(config.Map)
@@ -503,7 +521,7 @@ func TestBadResourceType(t *testing.T) {
 		return err
 	})
 
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
 		Steps: []lt.TestStep{{
@@ -564,7 +582,7 @@ func TestProviderCancellation(t *testing.T) {
 		errors := make([]error, resourceCount)
 		var resources sync.WaitGroup
 		resources.Add(resourceCount)
-		for i := 0; i < resourceCount; i++ {
+		for i := range resourceCount {
 			go func(idx int) {
 				_, errors[idx] = monitor.RegisterResource("pkgA:m:typA", fmt.Sprintf("res%d", idx), true)
 				resources.Done()
@@ -583,7 +601,7 @@ func TestProviderCancellation(t *testing.T) {
 	options := lt.TestUpdateOptions{
 		T: t,
 
-		HostF: deploytest.NewPluginHostF(nil, nil, programF, loaders...),
+		HostF: deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...),
 		UpdateOptions: UpdateOptions{
 			Parallel: resourceCount,
 		},
@@ -621,7 +639,7 @@ func TestLanguageRuntimeCancellation(t *testing.T) {
 		})
 	}
 
-	options := lt.TestUpdateOptions{T: t, HostF: deploytest.NewPluginHostF(nil, nil, programF)}
+	options := lt.TestUpdateOptions{T: t, HostF: deploytest.NewPluginHostF(nil, nil, programF, nil, nil)}
 
 	p := &lt.TestPlan{}
 	project, target := p.GetProject(), p.GetTarget(t, nil)
@@ -643,8 +661,8 @@ func TestPreviewWithPendingOperations(t *testing.T) {
 	const resType = "pkgA:m:typA"
 	urnA := p.NewURN(resType, "resA", "")
 
-	newResource := func(urn resource.URN, id resource.ID, del bool, dependencies ...resource.URN) *resource.State {
-		return &resource.State{
+	newResource := func(urn resource.URN, id resource.ID, del bool, dependencies ...resource.URN) *pkgresource.State {
+		return &pkgresource.State{
 			Type:         urn.Type(),
 			URN:          urn,
 			Custom:       true,
@@ -657,11 +675,11 @@ func TestPreviewWithPendingOperations(t *testing.T) {
 	}
 
 	old := &deploy.Snapshot{
-		PendingOperations: []resource.Operation{{
+		PendingOperations: []pkgresource.Operation{{
 			Resource: newResource(urnA, "0", false),
-			Type:     resource.OperationTypeUpdating,
+			Type:     pkgresource.OperationTypeUpdating,
 		}},
-		Resources: []*resource.State{
+		Resources: []*pkgresource.State{
 			newResource(urnA, "0", false),
 		},
 	}
@@ -680,7 +698,7 @@ func TestPreviewWithPendingOperations(t *testing.T) {
 
 	op := lt.TestOp(Update)
 
-	options := lt.TestUpdateOptions{T: t, HostF: deploytest.NewPluginHostF(nil, nil, programF, loaders...)}
+	options := lt.TestUpdateOptions{T: t, HostF: deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)}
 	project, target := p.GetProject(), p.GetTarget(t, old)
 
 	// A preview should succeed despite the pending operations.
@@ -697,8 +715,8 @@ func TestRefreshWithPendingOperations(t *testing.T) {
 	const resType = "pkgA:m:typA"
 	urnA := p.NewURN(resType, "resA", "")
 
-	newResource := func(urn resource.URN, id resource.ID, del bool, dependencies ...resource.URN) *resource.State {
-		return &resource.State{
+	newResource := func(urn resource.URN, id resource.ID, del bool, dependencies ...resource.URN) *pkgresource.State {
+		return &pkgresource.State{
 			Type:         urn.Type(),
 			URN:          urn,
 			Custom:       true,
@@ -711,11 +729,11 @@ func TestRefreshWithPendingOperations(t *testing.T) {
 	}
 
 	old := &deploy.Snapshot{
-		PendingOperations: []resource.Operation{{
+		PendingOperations: []pkgresource.Operation{{
 			Resource: newResource(urnA, "0", false),
-			Type:     resource.OperationTypeUpdating,
+			Type:     pkgresource.OperationTypeUpdating,
 		}},
-		Resources: []*resource.State{
+		Resources: []*pkgresource.State{
 			newResource(urnA, "0", false),
 		},
 	}
@@ -733,7 +751,7 @@ func TestRefreshWithPendingOperations(t *testing.T) {
 	})
 
 	op := lt.TestOp(Update)
-	options := lt.TestUpdateOptions{T: t, HostF: deploytest.NewPluginHostF(nil, nil, programF, loaders...)}
+	options := lt.TestUpdateOptions{T: t, HostF: deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)}
 	project, target := p.GetProject(), p.GetTarget(t, old)
 
 	// With a refresh, the update should succeed.
@@ -764,8 +782,8 @@ func TestRefreshPreservesPendingCreateOperations(t *testing.T) {
 	urnA := p.NewURN(resType, "resA", "")
 	urnB := p.NewURN(resType, "resB", "")
 
-	newResource := func(urn resource.URN, id resource.ID, del bool, dependencies ...resource.URN) *resource.State {
-		return &resource.State{
+	newResource := func(urn resource.URN, id resource.ID, del bool, dependencies ...resource.URN) *pkgresource.State {
+		return &pkgresource.State{
 			Type:         urn.Type(),
 			URN:          urn,
 			Custom:       true,
@@ -783,17 +801,17 @@ func TestRefreshPreservesPendingCreateOperations(t *testing.T) {
 	resA := newResource(urnA, "0", false)
 	resB := newResource(urnB, "0", false)
 	old := &deploy.Snapshot{
-		PendingOperations: []resource.Operation{
+		PendingOperations: []pkgresource.Operation{
 			{
 				Resource: resA,
-				Type:     resource.OperationTypeUpdating,
+				Type:     pkgresource.OperationTypeUpdating,
 			},
 			{
 				Resource: resB,
-				Type:     resource.OperationTypeCreating,
+				Type:     pkgresource.OperationTypeCreating,
 			},
 		},
-		Resources: []*resource.State{
+		Resources: []*pkgresource.State{
 			resA,
 		},
 	}
@@ -811,7 +829,7 @@ func TestRefreshPreservesPendingCreateOperations(t *testing.T) {
 	})
 
 	op := lt.TestOp(Update)
-	options := lt.TestUpdateOptions{T: t, HostF: deploytest.NewPluginHostF(nil, nil, programF, loaders...)}
+	options := lt.TestUpdateOptions{T: t, HostF: deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)}
 	project, target := p.GetProject(), p.GetTarget(t, old)
 
 	// With a refresh, the update should succeed.
@@ -821,12 +839,12 @@ func TestRefreshPreservesPendingCreateOperations(t *testing.T) {
 	require.NoError(t, err)
 	// Assert that pending CREATE operation was preserved
 	require.Len(t, new.PendingOperations, 1)
-	assert.Equal(t, resource.OperationTypeCreating, new.PendingOperations[0].Type)
+	assert.Equal(t, pkgresource.OperationTypeCreating, new.PendingOperations[0].Type)
 	assert.Equal(t, urnB, new.PendingOperations[0].Resource.URN)
 }
 
-func findPendingOperationsByType(opType resource.OperationType, snapshot *deploy.Snapshot) []resource.Operation {
-	var operations []resource.Operation
+func findPendingOperationsByType(opType pkgresource.OperationType, snapshot *deploy.Snapshot) []pkgresource.Operation {
+	var operations []pkgresource.Operation
 	for _, operation := range snapshot.PendingOperations {
 		if operation.Type == opType {
 			operations = append(operations, operation)
@@ -845,8 +863,8 @@ func TestUpdateShowsWarningWithPendingOperations(t *testing.T) {
 	urnA := p.NewURN(resType, "resA", "")
 	urnB := p.NewURN(resType, "resB", "")
 
-	newResource := func(urn resource.URN, id resource.ID, del bool, dependencies ...resource.URN) *resource.State {
-		return &resource.State{
+	newResource := func(urn resource.URN, id resource.ID, del bool, dependencies ...resource.URN) *pkgresource.State {
+		return &pkgresource.State{
 			Type:         urn.Type(),
 			URN:          urn,
 			Custom:       true,
@@ -859,17 +877,17 @@ func TestUpdateShowsWarningWithPendingOperations(t *testing.T) {
 	}
 
 	old := &deploy.Snapshot{
-		PendingOperations: []resource.Operation{
+		PendingOperations: []pkgresource.Operation{
 			{
 				Resource: newResource(urnA, "0", false),
-				Type:     resource.OperationTypeUpdating,
+				Type:     pkgresource.OperationTypeUpdating,
 			},
 			{
 				Resource: newResource(urnB, "1", false),
-				Type:     resource.OperationTypeCreating,
+				Type:     pkgresource.OperationTypeCreating,
 			},
 		},
-		Resources: []*resource.State{
+		Resources: []*pkgresource.State{
 			newResource(urnA, "0", false),
 		},
 	}
@@ -887,7 +905,7 @@ func TestUpdateShowsWarningWithPendingOperations(t *testing.T) {
 	})
 
 	op := lt.TestOp(Update)
-	options := lt.TestUpdateOptions{T: t, HostF: deploytest.NewPluginHostF(nil, nil, programF, loaders...)}
+	options := lt.TestUpdateOptions{T: t, HostF: deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)}
 	project, target := p.GetProject(), p.GetTarget(t, old)
 
 	// The update should succeed but give a warning
@@ -913,12 +931,12 @@ func TestUpdateShowsWarningWithPendingOperations(t *testing.T) {
 	new, _ := op.Run(project, target, options, false, nil, validate)
 	require.NotNil(t, new)
 
-	assert.Equal(t, resource.OperationTypeCreating, new.PendingOperations[0].Type)
+	assert.Equal(t, pkgresource.OperationTypeCreating, new.PendingOperations[0].Type)
 
 	// Assert that CREATE pending operations are retained
 	// TODO: should revisit whether non-CREATE pending operations should also be retained
 	require.Len(t, new.PendingOperations, 1)
-	createOperations := findPendingOperationsByType(resource.OperationTypeCreating, new)
+	createOperations := findPendingOperationsByType(pkgresource.OperationTypeCreating, new)
 	require.Len(t, createOperations, 1)
 	assert.Equal(t, urnB, createOperations[0].Resource.URN)
 }
@@ -957,7 +975,7 @@ func TestUpdatePartialFailure(t *testing.T) {
 		return err
 	})
 
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 	p := &lt.TestPlan{Options: lt.TestUpdateOptions{T: t, HostF: hostF}}
 
 	resURN := p.NewURN("pkgA:m:typA", "resA", "")
@@ -997,7 +1015,7 @@ func TestUpdatePartialFailure(t *testing.T) {
 	}}
 
 	old := &deploy.Snapshot{
-		Resources: []*resource.State{
+		Resources: []*pkgresource.State{
 			{
 				Type:   resURN.Type(),
 				URN:    resURN,
@@ -1047,7 +1065,7 @@ func TestStackReference(t *testing.T) {
 				}
 			},
 		},
-		Options: lt.TestUpdateOptions{T: t, HostF: deploytest.NewPluginHostF(nil, nil, programF, loaders...)},
+		Options: lt.TestUpdateOptions{T: t, HostF: deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)},
 		Steps:   lt.MakeBasicLifecycleSteps(t, 2),
 	}
 	p.Run(t, nil)
@@ -1055,7 +1073,7 @@ func TestStackReference(t *testing.T) {
 	// Test that changes to `name` cause replacement.
 	resURN := p.NewURN("pulumi:pulumi:StackReference", "other", "")
 	old := &deploy.Snapshot{
-		Resources: []*resource.State{
+		Resources: []*pkgresource.State{
 			{
 				Type:     resURN.Type(),
 				URN:      resURN,
@@ -1105,7 +1123,7 @@ func TestStackReference(t *testing.T) {
 		assert.Error(t, err)
 		return err
 	})
-	p.Options = lt.TestUpdateOptions{T: t, HostF: deploytest.NewPluginHostF(nil, nil, programF, loaders...)}
+	p.Options = lt.TestUpdateOptions{T: t, HostF: deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)}
 	p.Steps = []lt.TestStep{{
 		Op:            Update,
 		ExpectFailure: true,
@@ -1123,7 +1141,7 @@ func TestStackReference(t *testing.T) {
 		assert.Error(t, err)
 		return err
 	})
-	p.Options = lt.TestUpdateOptions{T: t, HostF: deploytest.NewPluginHostF(nil, nil, programF, loaders...)}
+	p.Options = lt.TestUpdateOptions{T: t, HostF: deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)}
 	p.Run(t, nil)
 }
 
@@ -1203,7 +1221,7 @@ func TestStackReferenceRegister(t *testing.T) {
 				}
 			},
 		},
-		Options: lt.TestUpdateOptions{T: t, HostF: deploytest.NewPluginHostF(nil, nil, programF, loaders...)},
+		Options: lt.TestUpdateOptions{T: t, HostF: deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)},
 		Steps:   steps,
 	}
 	p.Run(t, nil)
@@ -1211,7 +1229,7 @@ func TestStackReferenceRegister(t *testing.T) {
 	// Test that changes to `name` cause replacement.
 	resURN := p.NewURN("pulumi:pulumi:StackReference", "other", "")
 	old := &deploy.Snapshot{
-		Resources: []*resource.State{
+		Resources: []*pkgresource.State{
 			{
 				Type:   resURN.Type(),
 				URN:    resURN,
@@ -1261,7 +1279,7 @@ func TestStackReferenceRegister(t *testing.T) {
 		assert.Error(t, err)
 		return err
 	})
-	p.Options = lt.TestUpdateOptions{T: t, HostF: deploytest.NewPluginHostF(nil, nil, programF, loaders...)}
+	p.Options = lt.TestUpdateOptions{T: t, HostF: deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)}
 	p.Steps = []lt.TestStep{{
 		Op:            Update,
 		ExpectFailure: true,
@@ -1280,7 +1298,7 @@ func TestStackReferenceRegister(t *testing.T) {
 		assert.Error(t, err)
 		return err
 	})
-	p.Options = lt.TestUpdateOptions{T: t, HostF: deploytest.NewPluginHostF(nil, nil, programF, loaders...)}
+	p.Options = lt.TestUpdateOptions{T: t, HostF: deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)}
 	p.Run(t, nil)
 }
 
@@ -1363,7 +1381,7 @@ func TestLoadFailureShutdown(t *testing.T) {
 
 	op := lt.TestOp(Update)
 	sink := diag.DefaultSink(sinkWriter, sinkWriter, diag.FormatOptions{Color: colors.Raw})
-	options := lt.TestUpdateOptions{T: t, HostF: deploytest.NewPluginHostF(sink, sink, programF, loaders...)}
+	options := lt.TestUpdateOptions{T: t, HostF: deploytest.NewPluginHostF(sink, sink, programF, nil, nil, loaders...)}
 	p := &lt.TestPlan{}
 	project, target := p.GetProject(), p.GetTarget(t, nil)
 
@@ -1407,7 +1425,7 @@ func TestSingleResourceIgnoreChanges(t *testing.T) {
 			require.NoError(t, err)
 			return nil
 		})
-		hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+		hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 		p := &lt.TestPlan{
 			// Skip display tests because secrets are serialized with the blinding crypter and can't be restored
 			Options: lt.TestUpdateOptions{T: t, HostF: hostF, SkipDisplayTests: true},
@@ -1569,7 +1587,7 @@ func TestIgnoreChangesInvalidPaths(t *testing.T) {
 	runtimeF := deploytest.NewLanguageRuntimeF(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
 		return program(monitor)
 	})
-	hostF := deploytest.NewPluginHostF(nil, nil, runtimeF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, runtimeF, nil, nil, loaders...)
 
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
@@ -1678,7 +1696,7 @@ func replaceOnChangesTest(t *testing.T, name string, diffFunc DiffFunc) {
 				require.NoError(t, err)
 				return nil
 			})
-			hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+			hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 			p := &lt.TestPlan{
 				Options: lt.TestUpdateOptions{T: t, HostF: hostF},
 				Steps: []lt.TestStep{
@@ -1814,7 +1832,7 @@ func TestPersistentDiff(t *testing.T) {
 		require.NoError(t, err)
 		return nil
 	})
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
@@ -1895,7 +1913,7 @@ func TestDetailedDiffReplace(t *testing.T) {
 		require.NoError(t, err)
 		return nil
 	})
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
@@ -1940,13 +1958,13 @@ func TestCustomTimeouts(t *testing.T) {
 	programF := deploytest.NewLanguageRuntimeF(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
 		_, err := monitor.RegisterResource("pkgA:m:typA", "resA", true, deploytest.ResourceOptions{
 			CustomTimeouts: &resource.CustomTimeouts{
-				Create: 60, Delete: 60, Update: 240,
+				Create: 60, Delete: 60, Update: 240, Read: 30,
 			},
 		})
 		require.NoError(t, err)
 		return nil
 	})
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
@@ -1962,6 +1980,7 @@ func TestCustomTimeouts(t *testing.T) {
 	assert.Equal(t, snap.Resources[1].CustomTimeouts.Create, float64(60))
 	assert.Equal(t, snap.Resources[1].CustomTimeouts.Update, float64(240))
 	assert.Equal(t, snap.Resources[1].CustomTimeouts.Delete, float64(60))
+	assert.Equal(t, snap.Resources[1].CustomTimeouts.Read, float64(30))
 }
 
 func TestProviderDiffMissingOldOutputs(t *testing.T) {
@@ -1993,7 +2012,7 @@ func TestProviderDiffMissingOldOutputs(t *testing.T) {
 		require.NoError(t, err)
 		return nil
 	})
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
@@ -2091,7 +2110,7 @@ func TestMissingRead(t *testing.T) {
 		assert.Error(t, err)
 		return nil
 	})
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
 		Steps:   []lt.TestStep{{Op: Update, ExpectFailure: true}},
@@ -2162,7 +2181,7 @@ func TestProviderPreview(t *testing.T) {
 
 		return nil
 	})
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
@@ -2252,7 +2271,7 @@ func TestProviderPreviewGrpc(t *testing.T) {
 
 		return nil
 	})
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
@@ -2477,7 +2496,7 @@ func TestProviderPreviewUnknowns(t *testing.T) {
 
 		return nil
 	})
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
@@ -2616,7 +2635,7 @@ func TestLanguageClient(t *testing.T) {
 		}),
 	}
 
-	update, err := startUpdate(t, deploytest.NewPluginHostF(nil, nil, nil, loaders...))
+	update, err := startUpdate(t, deploytest.NewPluginHostF(nil, nil, nil, nil, nil, loaders...))
 	if err != nil {
 		t.Fatalf("failed to start update: %v", err)
 	}
@@ -2644,7 +2663,7 @@ func TestConfigSecrets(t *testing.T) {
 		require.NoError(t, err)
 		return nil
 	})
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 
 	crypter := config.NewSymmetricCrypter(make([]byte, 32))
 	//nolint:usetesting // outlives t.Context inside the engine
@@ -2688,7 +2707,7 @@ func TestComponentOutputs(t *testing.T) {
 		require.NoError(t, err)
 		return nil
 	})
-	hostF := deploytest.NewPluginHostF(nil, nil, programF)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil)
 
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
@@ -2756,7 +2775,7 @@ func TestProtect(t *testing.T) {
 
 		return nil
 	})
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
@@ -2911,7 +2930,7 @@ func TestImportDiff(t *testing.T) {
 
 		return nil
 	})
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
@@ -3030,7 +3049,7 @@ func TestDeletedWith(t *testing.T) {
 
 		return nil
 	})
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
@@ -3132,7 +3151,7 @@ func TestReplaceWithAndPropertyChange(t *testing.T) {
 		return nil
 	})
 
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
@@ -3180,7 +3199,7 @@ func TestInvalidGetIDReportsUserError(t *testing.T) {
 		assert.Error(t, err)
 		return nil
 	})
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
@@ -3237,7 +3256,7 @@ func TestEventSecrets(t *testing.T) {
 		require.NoError(t, err)
 		return nil
 	})
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 
 	p := &lt.TestPlan{
 		// Skip display tests because secrets are serialized with the blinding crypter and can't be restored
@@ -3323,7 +3342,7 @@ func TestAdditionalSecretOutputs(t *testing.T) {
 		require.NoError(t, err)
 		return nil
 	})
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
@@ -3406,7 +3425,7 @@ func TestDefaultParents(t *testing.T) {
 
 		return nil
 	})
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
@@ -3553,7 +3572,7 @@ func TestPendingDeleteOrder(t *testing.T) {
 
 		return nil
 	})
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
@@ -3714,7 +3733,7 @@ func TestPendingDeleteReplacement(t *testing.T) {
 
 		return nil
 	})
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
@@ -3807,7 +3826,7 @@ func TestTimestampTracking(t *testing.T) {
 		return nil
 	})
 
-	p.Options.HostF = deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	p.Options.HostF = deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 	p.Options.T = t
 	// Run an update to create the resource -- created and updated should be set and equal.
 	p.Steps = []lt.TestStep{{Op: Update, SkipPreview: true}}
@@ -3902,9 +3921,7 @@ func TestOldCheckedInputsAreSent(t *testing.T) {
 
 					// Add a default property
 					results := resource.PropertyMap{}
-					for k, v := range req.News {
-						results[k] = v
-					}
+					maps.Copy(results, req.News)
 					results["default"] = resource.NewProperty("default")
 
 					return plugin.CheckResponse{Properties: results}, nil
@@ -3939,9 +3956,7 @@ func TestOldCheckedInputsAreSent(t *testing.T) {
 				CreateF: func(_ context.Context, req plugin.CreateRequest) (plugin.CreateResponse, error) {
 					id := resource.ID("")
 					results := resource.PropertyMap{}
-					for k, v := range req.Properties {
-						results[k] = v
-					}
+					maps.Copy(results, req.Properties)
 					// Add a computed property
 					results["computed"] = resource.MakeComputed(resource.NewProperty(""))
 
@@ -3972,9 +3987,7 @@ func TestOldCheckedInputsAreSent(t *testing.T) {
 					}), req.NewInputs)
 
 					results := resource.PropertyMap{}
-					for k, v := range req.NewInputs {
-						results[k] = v
-					}
+					maps.Copy(results, req.NewInputs)
 					// Add a computed property
 					results["computed"] = resource.MakeComputed(resource.NewProperty(""))
 
@@ -4015,7 +4028,7 @@ func TestOldCheckedInputsAreSent(t *testing.T) {
 		require.NoError(t, err)
 		return nil
 	})
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
@@ -4131,7 +4144,7 @@ func TestResourceNames(t *testing.T) {
 
 				return nil
 			})
-			hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+			hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 			p := &lt.TestPlan{
 				Options: lt.TestUpdateOptions{T: t, HostF: hostF},
 			}
@@ -4170,7 +4183,7 @@ func TestSourcePositions(t *testing.T) {
 					resp, err := monitor.RegisterResource("pkgA:m:typA", req.Name+"/resA", true, deploytest.ResourceOptions{
 						Inputs:         inputs,
 						SourcePosition: fileURL(providerRegPos),
-						StackTrace: []resource.StackFrame{
+						StackTrace: []pkgresource.StackFrame{
 							{SourcePosition: fileURL(providerPos)},
 							{SourcePosition: fileURL(providerRegPos)},
 						},
@@ -4187,7 +4200,7 @@ func TestSourcePositions(t *testing.T) {
 						"",
 						"",
 						fileURL(providerCallPos),
-						[]resource.StackFrame{
+						[]pkgresource.StackFrame{
 							{SourcePosition: fileURL(providerPos)},
 							{SourcePosition: fileURL(providerCallPos)},
 						}, req.Info.StackTraceHandle,
@@ -4210,7 +4223,7 @@ func TestSourcePositions(t *testing.T) {
 						"",
 						"",
 						fileURL(providerReadPos),
-						[]resource.StackFrame{
+						[]pkgresource.StackFrame{
 							{SourcePosition: fileURL(providerPos)},
 							{SourcePosition: fileURL(providerReadPos)},
 						},
@@ -4251,7 +4264,7 @@ func TestSourcePositions(t *testing.T) {
 		_, err := monitor.RegisterResource("pkgA:m:typA", "resA", true, deploytest.ResourceOptions{
 			Inputs:         inputs,
 			SourcePosition: fileURL(regPos),
-			StackTrace: []resource.StackFrame{
+			StackTrace: []pkgresource.StackFrame{
 				{SourcePosition: fileURL(progPos)},
 				{SourcePosition: fileURL(regPos)},
 			},
@@ -4267,7 +4280,7 @@ func TestSourcePositions(t *testing.T) {
 			"",
 			"",
 			fileURL(readPos),
-			[]resource.StackFrame{
+			[]pkgresource.StackFrame{
 				{SourcePosition: fileURL(progPos)},
 				{SourcePosition: fileURL(readPos)},
 			},
@@ -4280,7 +4293,7 @@ func TestSourcePositions(t *testing.T) {
 			Remote:         true,
 			Inputs:         inputs,
 			SourcePosition: fileURL(constructPos),
-			StackTrace: []resource.StackFrame{
+			StackTrace: []pkgresource.StackFrame{
 				{SourcePosition: fileURL(progPos)},
 				{SourcePosition: fileURL(constructPos)},
 			},
@@ -4288,7 +4301,7 @@ func TestSourcePositions(t *testing.T) {
 		require.NoError(t, err)
 
 		callInputs := resource.PropertyMap{"name": resource.NewProperty("progCall")}
-		_, _, _, err = monitor.Call("pkgA:m:callA", callInputs, nil, "", "", "", fileURL(callPos), []resource.StackFrame{
+		_, _, _, err = monitor.Call("pkgA:m:callA", callInputs, nil, "", "", "", fileURL(callPos), []pkgresource.StackFrame{
 			{SourcePosition: fileURL(progPos)},
 			{SourcePosition: fileURL(callPos)},
 		}, "")
@@ -4296,7 +4309,7 @@ func TestSourcePositions(t *testing.T) {
 
 		return nil
 	})
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
@@ -4319,7 +4332,7 @@ func TestSourcePositions(t *testing.T) {
 	reg := snap.Resources[1]
 	assert.Equal(t, regURN, reg.URN)
 	assert.Equal(t, projURL(regPos), reg.SourcePosition)
-	assert.Equal(t, []resource.StackFrame{
+	assert.Equal(t, []pkgresource.StackFrame{
 		{SourcePosition: projURL(progPos)},
 		{SourcePosition: projURL(regPos)},
 	}, reg.StackTrace)
@@ -4327,7 +4340,7 @@ func TestSourcePositions(t *testing.T) {
 	read := snap.Resources[2]
 	assert.Equal(t, readURN, read.URN)
 	assert.Equal(t, projURL(readPos), read.SourcePosition)
-	assert.Equal(t, []resource.StackFrame{
+	assert.Equal(t, []pkgresource.StackFrame{
 		{SourcePosition: projURL(progPos)},
 		{SourcePosition: projURL(readPos)},
 	}, read.StackTrace)
@@ -4335,7 +4348,7 @@ func TestSourcePositions(t *testing.T) {
 	reg2 := snap.Resources[3]
 	assert.Equal(t, reg2URN, reg2.URN)
 	assert.Equal(t, projURL(providerRegPos), reg2.SourcePosition)
-	assert.Equal(t, []resource.StackFrame{
+	assert.Equal(t, []pkgresource.StackFrame{
 		{SourcePosition: projURL(progPos)},
 		{SourcePosition: projURL(constructPos)},
 		{SourcePosition: projURL(providerPos)},
@@ -4345,7 +4358,7 @@ func TestSourcePositions(t *testing.T) {
 	read2 := snap.Resources[4]
 	assert.Equal(t, read2URN, read2.URN)
 	assert.Equal(t, projURL(providerReadPos), read2.SourcePosition)
-	assert.Equal(t, []resource.StackFrame{
+	assert.Equal(t, []pkgresource.StackFrame{
 		{SourcePosition: projURL(progPos)},
 		{SourcePosition: projURL(constructPos)},
 		{SourcePosition: projURL(providerPos)},
@@ -4357,7 +4370,7 @@ func TestSourcePositions(t *testing.T) {
 	read3 := snap.Resources[5]
 	assert.Equal(t, read3URN, read3.URN)
 	assert.Equal(t, projURL(providerReadPos), read3.SourcePosition)
-	assert.Equal(t, []resource.StackFrame{
+	assert.Equal(t, []pkgresource.StackFrame{
 		{SourcePosition: projURL(progPos)},
 		{SourcePosition: projURL(callPos)},
 		{SourcePosition: projURL(providerPos)},
@@ -4442,7 +4455,7 @@ func TestBadResourceOptionURNs(t *testing.T) {
 				tt.assertFn(err)
 				return nil
 			})
-			hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+			hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 
 			p := &lt.TestPlan{
 				Options: lt.TestUpdateOptions{T: t, HostF: hostF},
@@ -4483,7 +4496,7 @@ func TestProviderChecksums(t *testing.T) {
 		}
 		return nil
 	})
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
@@ -4530,7 +4543,7 @@ func TestAutomaticDiff(t *testing.T) {
 		require.NoError(t, err)
 		return nil
 	})
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
@@ -4624,7 +4637,7 @@ func TestStackOutputsProgramError(t *testing.T) {
 		return nil
 	})
 
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
 	}
@@ -4729,7 +4742,7 @@ func TestStackOutputsResourceError(t *testing.T) {
 		return err
 	})
 
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 	p := &lt.TestPlan{
 		// Skip display tests because secrets are serialized with the blinding crypter and can't be restored
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF, SkipDisplayTests: true},
@@ -4824,7 +4837,7 @@ func TestParallelDiff(t *testing.T) {
 
 		return nil
 	})
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{
@@ -4904,7 +4917,7 @@ func TestConstructHangsAfterRegisterResourceFailure(t *testing.T) {
 		require.ErrorContains(t, err, "resource monitor shut down while waiting for construct to complete")
 		return nil
 	})
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
@@ -4948,7 +4961,7 @@ func TestProgramError(t *testing.T) {
 		return nil
 	})
 
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
 	}
@@ -4998,7 +5011,7 @@ func TestResourceError(t *testing.T) {
 		return nil
 	})
 
-	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, nil, nil, loaders...)
 	p := &lt.TestPlan{
 		Options: lt.TestUpdateOptions{T: t, HostF: hostF},
 	}

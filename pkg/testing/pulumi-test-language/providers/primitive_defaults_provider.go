@@ -18,13 +18,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 
 	"github.com/blang/semver"
 
 	"github.com/pulumi/pulumi/pkg/v3/codegen/schema"
+	"github.com/pulumi/pulumi/pkg/v3/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 )
 
 // Like PrimitiveProvider but with all fields optional in schema and defaults specified there.
@@ -43,10 +43,6 @@ func (p *PrimitiveDefaultsProvider) Configure(
 	context.Context, plugin.ConfigureRequest,
 ) (plugin.ConfigureResponse, error) {
 	return plugin.ConfigureResponse{}, nil
-}
-
-func (p *PrimitiveDefaultsProvider) Pkg() tokens.Package {
-	return "primitive-defaults"
 }
 
 func (p *PrimitiveDefaultsProvider) GetSchema(
@@ -137,9 +133,7 @@ func (p *PrimitiveDefaultsProvider) Check(
 
 	// Start with user-provided values.
 	props := resource.PropertyMap{}
-	for k, v := range req.News {
-		props[k] = v
-	}
+	maps.Copy(props, req.News)
 
 	// For each optional property: assert it is present and validate its type.
 	assertPresentAndType := func(

@@ -78,6 +78,34 @@ func TestLanguageNewSmoke(t *testing.T) {
 	}
 }
 
+// TestHCLLanguageDownloadSmoke checks that the engine can transparently download the unbundled
+// pulumi-language-hcl runtime and use it to run a program. HCL is the first language runtime that
+// is not shipped in the CLI tarball, so this exercises the on-demand language-plugin acquisition
+// path end to end: a clean PULUMI_HOME has no hcl runtime, so `pulumi up` must fetch it from the
+// pinned release and launch it to run the (resource-free) program.
+func TestHCLLanguageDownloadSmoke(t *testing.T) {
+	t.Parallel()
+
+	e := ptesting.NewEnvironment(t)
+	defer e.DeleteIfNotFailed()
+
+	// The engine only downloads the language runtime when automatic acquisition is enabled.
+	e.Env = append(e.Env, "PULUMI_DISABLE_AUTOMATIC_PLUGIN_ACQUISITION=false")
+
+	e.ImportDirectory("testdata/hcl_smoke")
+
+	e.RunCommand("pulumi", "login", "--cloud-url", e.LocalURL())
+	e.RunCommand("pulumi", "stack", "init", "test")
+	e.RunCommand("pulumi", "up", "--yes")
+
+	// The runtime should now be resolvable as an installed language plugin, proving it was fetched
+	// rather than already bundled.
+	plugins, _ := e.RunCommand("pulumi", "plugin", "ls")
+	assert.Regexp(t, `hcl\s+language`, plugins)
+
+	e.RunCommand("pulumi", "destroy", "--yes")
+}
+
 // Quick sanity test that `pulumi package new` can scaffold a package from a live template.
 func TestPackageNewSmoke(t *testing.T) {
 	t.Parallel()
@@ -289,7 +317,7 @@ func TestPackageGetSchema(t *testing.T) {
 		err := json.Unmarshal([]byte(schemaJson), &schemaSpec)
 		require.NoError(t, err, "Unmarshalling schema specs from %s should work", pkg)
 		require.NotNil(t, schemaSpec, "Specification should be non-nil")
-		schema, diags, err := schema.BindSpec(*schemaSpec, nil, schema.ValidationOptions{
+		schema, diags, err := schema.BindSpec(*schemaSpec, schema.NewNullLoader(), schema.ValidationOptions{
 			AllowDanglingReferences: true,
 		})
 		require.NoError(t, err, "Binding the schema spec should work")
@@ -343,7 +371,7 @@ func TestPackageGetSchema(t *testing.T) {
 	// Now try and get the parameterized schema from within a Pulumi project with a packages declaration.
 	err = os.WriteFile(
 		filepath.Join(e.CWD, "Pulumi.yaml"),
-		[]byte(fmt.Sprintf(`name: project
+		fmt.Appendf(nil, `name: project
 runtime: yaml
 packages:
   tp: %s
@@ -351,7 +379,7 @@ backend:
   url: '%s'`,
 			providerDir,
 			e.LocalURL(),
-		)), 0o600)
+		), 0o600)
 	require.NoError(t, err)
 
 	schemaJSON, _ = e.RunCommand("pulumi", "package", "get-schema", "tp", "parameter")
@@ -631,7 +659,7 @@ func TestInstall(t *testing.T) {
 
 			// Ensure `install` works and subsequent `up` and `destroy` operations work.
 			_, stderr := e.RunCommand("pulumi", "install")
-			assert.Regexp(t, regexp.MustCompile(`resource plugin random.+ installing`), stderr)
+			assert.Regexp(t, regexp.MustCompile(`Downloading provider random`), stderr)
 			e.RunCommand("pulumi", "stack", "init", "test")
 			e.RunCommand("pulumi", "up", "--yes")
 			e.RunCommand("pulumi", "destroy", "--yes")
@@ -691,13 +719,13 @@ func TestSecretsProvidersInitializationSmoke(t *testing.T) {
 				require.NoError(t, err)
 
 				projectYAML := filepath.Join(projectDir, "Pulumi.yaml")
-				err = os.WriteFile(projectYAML, []byte(fmt.Sprintf(`name: project
+				err = os.WriteFile(projectYAML, fmt.Appendf(nil, `name: project
 runtime: %s
 backend:
   url: '%s'`,
 					runtime,
 					e.LocalURL(),
-				)), 0o600)
+				), 0o600)
 				require.NoError(t, err)
 
 				stackYAML := filepath.Join(projectDir, "Pulumi.dev.yaml")
@@ -1260,7 +1288,7 @@ func TestDoCommandLocalRun(t *testing.T) {
 	// is the JSON result. The provider still captures stdout/stderr as outputs.
 	e.WriteTestFile("inputs.pcl", `command = "echo hello"`+"\n"+`logging = "none"`+"\n")
 
-	stdout, stderr := e.RunCommand("pulumi", "do", "command:local:run", "--input-file", "inputs.pcl")
+	stdout, stderr := e.RunCommand("pulumi", "do", "command:local:run", "--input", "pcl", "--input-file", "inputs.pcl")
 
 	// Guard against the dynamic-subcommand re-execute racing with the root command's update-check goroutine and
 	// producing a "send on closed channel" panic. The panic is intermittent so it doesn't always reproduce, but
@@ -1314,8 +1342,8 @@ func TestDoCommandLocalCommand(t *testing.T) {
 	e.WriteTestFile("inputs.pcl", "create = \"echo hello\"\n")
 
 	stdout, stderr := e.RunCommand(
-		"pulumi", "do", "command:local:Command", "create",
-		"--input-file", "inputs.pcl", "--yes")
+		"pulumi", "do", "--stateless", "command:local:Command", "create",
+		"--input", "pcl", "--input-file", "inputs.pcl", "--yes")
 
 	// Guard against the dynamic-subcommand re-execute racing with the root command's update-check goroutine and
 	// producing a "send on closed channel" panic. The panic is intermittent so it doesn't always reproduce, but
@@ -1337,4 +1365,18 @@ func TestPulumiNewEmptyOperations(t *testing.T) {
 	e.RunCommand("pulumi", "new", "-y")
 	e.RunCommand("pulumi", "stack", "init", "testing")
 	e.RunCommand("pulumi", "config", "set", "key", "value")
+}
+
+// Test that `pulumi --version` prints the same output as `pulumi version`.
+func TestVersionFlag(t *testing.T) {
+	t.Parallel()
+
+	e := ptesting.NewEnvironment(t)
+	defer e.DeleteIfNotFailed()
+
+	versionCmdStdout, _ := e.RunCommand("pulumi", "version")
+	versionFlagStdout, _ := e.RunCommand("pulumi", "--version")
+
+	assert.NotEmpty(t, strings.TrimSpace(versionCmdStdout))
+	assert.Equal(t, versionCmdStdout, versionFlagStdout)
 }

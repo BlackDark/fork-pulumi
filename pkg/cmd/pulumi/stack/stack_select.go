@@ -54,7 +54,7 @@ func newStackSelectCmd() *cobra.Command {
 			}
 
 			// Try to read the current project
-			project, root, err := ws.ReadProject()
+			project, root, err := ws.ReadProject("")
 			if err != nil && !errors.Is(err, workspace.ErrProjectNotFound) {
 				return err
 			}
@@ -95,7 +95,7 @@ func newStackSelectCmd() *cobra.Command {
 				}
 				// If create flag was passed and stack was not found, create it and select it.
 				if create && stack != "" {
-					s, err := InitStack(ctx, sink, ws, b, stack, root, false, secretsProvider, false /*useRemoteConfig*/)
+					s, err := InitStack(ctx, sink, ws, b, stack, root, false, secretsProvider, false /*useRemoteConfig*/, "")
 					if err != nil {
 						return err
 					}
@@ -113,6 +113,7 @@ func newStackSelectCmd() *cobra.Command {
 				b,
 				OfferNew|SetCurrent,
 				opts,
+				"",
 			)
 			if err != nil {
 				return err

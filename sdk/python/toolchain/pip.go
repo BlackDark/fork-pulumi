@@ -369,7 +369,7 @@ func resolveWindowsExecutionAlias(pythonCmds []string) (string, string, error) {
 	exts := []string{""}
 	x := os.Getenv(`PATHEXT`)
 	if x != "" {
-		for _, e := range strings.Split(strings.ToLower(x), `;`) {
+		for e := range strings.SplitSeq(strings.ToLower(x), `;`) {
 			if e == "" {
 				continue
 			}
@@ -519,7 +519,9 @@ func InstallDependencies(ctx context.Context, cwd, venvDir string, useLanguageVe
 				return nil
 			}
 			if attempt < maxAttempts-1 && pipErrorIsTransient(stderrBuf.String()) {
-				fmt.Fprintf(errorWriter, "Retrying (%d/%d)...\n", attempt+1, maxAttempts)
+				if showOutput {
+					fmt.Fprintf(errorWriter, "Retrying (%d/%d)...\n", attempt+1, maxAttempts)
+				}
 				continue
 			}
 			return lastErr

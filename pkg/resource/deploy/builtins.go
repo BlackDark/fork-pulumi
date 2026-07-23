@@ -20,12 +20,15 @@ import (
 	"fmt"
 	"sort"
 
-	uuid "github.com/gofrs/uuid"
+	pkgresource "github.com/pulumi/pulumi/pkg/v3/resource"
 
+	uuid "github.com/gofrs/uuid"
+	"go.opentelemetry.io/otel"
+
+	"github.com/pulumi/pulumi/pkg/v3/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/util/cmdutil"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi-internal/gsync"
 )
@@ -42,15 +45,15 @@ type builtinProvider struct {
 	backendClient BackendClient
 
 	// news is a map of URNs to new resource states that have been produced by the current deployment.
-	news *gsync.Map[resource.URN, *resource.State]
+	news *gsync.Map[resource.URN, *pkgresource.State]
 	// reads is a map of URNs to resource states that have been read during the current deployment.
-	reads *gsync.Map[resource.URN, *resource.State]
+	reads *gsync.Map[resource.URN, *pkgresource.State]
 }
 
 func newBuiltinProvider(
 	backendClient BackendClient,
-	news *gsync.Map[resource.URN, *resource.State],
-	reads *gsync.Map[resource.URN, *resource.State],
+	news *gsync.Map[resource.URN, *pkgresource.State],
+	reads *gsync.Map[resource.URN, *pkgresource.State],
 	d diag.Sink,
 ) *builtinProvider {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -66,10 +69,6 @@ func newBuiltinProvider(
 
 func (p *builtinProvider) Close() error {
 	return nil
-}
-
-func (p *builtinProvider) Pkg() tokens.Package {
-	return "pulumi"
 }
 
 func (p *builtinProvider) Handshake(
@@ -197,12 +196,12 @@ func (p *builtinProvider) Diff(_ context.Context, req plugin.DiffRequest) (plugi
 	}
 }
 
-func (p *builtinProvider) Create(_ context.Context, req plugin.CreateRequest) (plugin.CreateResponse, error) {
+func (p *builtinProvider) Create(ctx context.Context, req plugin.CreateRequest) (plugin.CreateResponse, error) {
 	typ := req.URN.Type()
 	switch typ { //nolint:exhaustive
 	case stackReferenceType:
 
-		state, err := p.readStackReference(req.Properties)
+		state, err := p.readStackReference(ctx, req.Properties)
 		if err != nil {
 			return plugin.CreateResponse{Status: resource.StatusUnknown}, err
 		}
@@ -275,7 +274,7 @@ func (p *builtinProvider) List(context.Context, plugin.ListRequest) (*plugin.Lis
 	return nil, errors.New("the builtin provider does not support List")
 }
 
-func (p *builtinProvider) Read(_ context.Context, req plugin.ReadRequest) (plugin.ReadResponse, error) {
+func (p *builtinProvider) Read(ctx context.Context, req plugin.ReadRequest) (plugin.ReadResponse, error) {
 	contract.Requiref(req.URN != "", "urn", "must not be empty")
 	contract.Requiref(req.ID != "", "id", "must not be empty")
 
@@ -293,7 +292,7 @@ func (p *builtinProvider) Read(_ context.Context, req plugin.ReadRequest) (plugi
 			return plugin.ReadResponse{Status: resource.StatusUnknown}, errors.New("stack reference can not be imported")
 		}
 
-		outputs, err := p.readStackReference(req.State)
+		outputs, err := p.readStackReference(ctx, req.State)
 		if err != nil {
 			return plugin.ReadResponse{Status: resource.StatusUnknown}, err
 		}
@@ -335,12 +334,12 @@ const (
 	getResource              = "pulumi:pulumi:getResource"
 )
 
-func (p *builtinProvider) Invoke(_ context.Context, req plugin.InvokeRequest) (plugin.InvokeResponse, error) {
+func (p *builtinProvider) Invoke(ctx context.Context, req plugin.InvokeRequest) (plugin.InvokeResponse, error) {
 	var outs resource.PropertyMap
 	var err error
 	switch req.Tok {
 	case readStackOutputs:
-		outs, err = p.readStackReference(req.Args)
+		outs, err = p.readStackReference(ctx, req.Args)
 	case readStackResourceOutputs:
 		outs, err = p.readStackResourceOutputs(req.Args)
 	case getResource:
@@ -368,7 +367,13 @@ func (p *builtinProvider) SignalCancellation(context.Context) error {
 	return nil
 }
 
-func (p *builtinProvider) readStackReference(inputs resource.PropertyMap) (resource.PropertyMap, error) {
+func (p *builtinProvider) readStackReference(
+	ctx context.Context, inputs resource.PropertyMap,
+) (resource.PropertyMap, error) {
+	tracer := otel.Tracer("pulumi-cli")
+	ctx, span := cmdutil.StartSpan(ctx, tracer, "builtinProvider.readStackReference")
+	defer span.End()
+
 	name, ok := inputs["name"]
 	contract.Assertf(ok, "missing required property 'name'")
 	contract.Assertf(name.IsString(), "expected 'name' to be a string")
@@ -381,7 +386,7 @@ func (p *builtinProvider) readStackReference(inputs resource.PropertyMap) (resou
 	// than failing outright.
 	var decryptionErr error
 	outputs, err := p.backendClient.GetStackOutputs(
-		p.context,
+		ctx,
 		name.StringValue(),
 		func(e error) error { decryptionErr = e; return nil },
 	)

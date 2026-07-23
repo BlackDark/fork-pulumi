@@ -24,9 +24,8 @@ import (
 	"github.com/blang/semver"
 
 	"github.com/pulumi/pulumi/pkg/v3/codegen/schema"
+	"github.com/pulumi/pulumi/pkg/v3/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 )
 
 type ParameterizedProvider struct {
@@ -49,10 +48,6 @@ func (p *ParameterizedProvider) Configure(
 	return plugin.ConfigureResponse{}, nil
 }
 
-func (p *ParameterizedProvider) Pkg() tokens.Package {
-	return "parameterized"
-}
-
 func title(s string) string {
 	if s == "" {
 		return s
@@ -64,7 +59,9 @@ func (p *ParameterizedProvider) GetSchema(
 	_ context.Context, req plugin.GetSchemaRequest,
 ) (plugin.GetSchemaResponse, error) {
 	if p.parameterPackage == "" {
-		return plugin.GetSchemaResponse{}, errors.New("expected a parameter package name for a parameterized provider")
+		return plugin.GetSchemaResponse{Schema: []byte(
+			`{ "name": "parameterized", "version": "1.2.3" }`,
+		)}, nil
 	}
 
 	if p.parameterVersion == "" {
@@ -98,7 +95,7 @@ func (p *ParameterizedProvider) GetSchema(
 	pkg := schema.PackageSpec{
 		Name:    subpackage,
 		Version: version,
-		Provider: schema.ResourceSpec{
+		Provider: &schema.ResourceSpec{
 			InputProperties: map[string]schema.PropertySpec{
 				"text": {
 					TypeSpec: schema.TypeSpec{

@@ -32,6 +32,23 @@ export class ProviderHandshakeRequest extends jspb.Message {
     getInvokeWithPreview(): boolean;
     setInvokeWithPreview(value: boolean): ProviderHandshakeRequest;
 
+    hasMapperTarget(): boolean;
+    clearMapperTarget(): void;
+    getMapperTarget(): string | undefined;
+    setMapperTarget(value: string): ProviderHandshakeRequest;
+
+    hasLoaderTarget(): boolean;
+    clearLoaderTarget(): void;
+    getLoaderTarget(): string | undefined;
+    setLoaderTarget(value: string): ProviderHandshakeRequest;
+
+    hasResolverTarget(): boolean;
+    clearResolverTarget(): void;
+    getResolverTarget(): string | undefined;
+    setResolverTarget(value: string): ProviderHandshakeRequest;
+    getAcceptsByteString(): boolean;
+    setAcceptsByteString(value: boolean): ProviderHandshakeRequest;
+
     serializeBinary(): Uint8Array;
     toObject(includeInstance?: boolean): ProviderHandshakeRequest.AsObject;
     static toObject(includeInstance: boolean, msg: ProviderHandshakeRequest): ProviderHandshakeRequest.AsObject;
@@ -51,6 +68,10 @@ export namespace ProviderHandshakeRequest {
         supportsViews: boolean,
         supportsRefreshBeforeUpdate: boolean,
         invokeWithPreview: boolean,
+        mapperTarget?: string,
+        loaderTarget?: string,
+        resolverTarget?: string,
+        acceptsByteString: boolean,
     }
 }
 
@@ -63,6 +84,8 @@ export class ProviderHandshakeResponse extends jspb.Message {
     setAcceptOutputs(value: boolean): ProviderHandshakeResponse;
     getSupportsAutonamingConfiguration(): boolean;
     setSupportsAutonamingConfiguration(value: boolean): ProviderHandshakeResponse;
+    getAcceptsByteString(): boolean;
+    setAcceptsByteString(value: boolean): ProviderHandshakeResponse;
 
     serializeBinary(): Uint8Array;
     toObject(includeInstance?: boolean): ProviderHandshakeResponse.AsObject;
@@ -80,6 +103,7 @@ export namespace ProviderHandshakeResponse {
         acceptResources: boolean,
         acceptOutputs: boolean,
         supportsAutonamingConfiguration: boolean,
+        acceptsByteString: boolean,
     }
 }
 
@@ -958,6 +982,8 @@ export class ReadRequest extends jspb.Message {
     getOldViewsList(): Array<View>;
     setOldViewsList(value: Array<View>): ReadRequest;
     addOldViews(value?: View, index?: number): View;
+    getTimeout(): number;
+    setTimeout(value: number): ReadRequest;
 
     serializeBinary(): Uint8Array;
     toObject(includeInstance?: boolean): ReadRequest.AsObject;
@@ -980,6 +1006,7 @@ export namespace ReadRequest {
         resourceStatusAddress: string,
         resourceStatusToken: string,
         oldViewsList: Array<View.AsObject>,
+        timeout: number,
     }
 }
 
@@ -1484,6 +1511,8 @@ export namespace ConstructRequest {
         setUpdate(value: string): CustomTimeouts;
         getDelete(): string;
         setDelete(value: string): CustomTimeouts;
+        getRead(): string;
+        setRead(value: string): CustomTimeouts;
 
         serializeBinary(): Uint8Array;
         toObject(includeInstance?: boolean): CustomTimeouts.AsObject;
@@ -1500,6 +1529,7 @@ export namespace ConstructRequest {
             create: string,
             update: string,
             pb_delete: string,
+            read: string,
         }
     }
 

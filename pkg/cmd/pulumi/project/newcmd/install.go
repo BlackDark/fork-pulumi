@@ -25,23 +25,29 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/packageinstallation"
 	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/packageresolution"
 	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/packageworkspace"
+	"github.com/pulumi/pulumi/pkg/v3/codegen/convert"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/schema"
+	pkghost "github.com/pulumi/pulumi/pkg/v3/host"
 	"github.com/pulumi/pulumi/pkg/v3/pluginstorage"
+	"github.com/pulumi/pulumi/pkg/v3/registry"
+	"github.com/pulumi/pulumi/pkg/v3/resource/plugin"
 	"github.com/pulumi/pulumi/pkg/v3/util/cmdutil"
 	pkgWorkspace "github.com/pulumi/pulumi/pkg/v3/workspace"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/env"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/registry"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
 	utilCmdutil "github.com/pulumi/pulumi/sdk/v3/go/common/util/cmdutil"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 )
 
 // InstallDependencies will install dependencies for the project, e.g. by running `npm install` for nodejs projects.
 func InstallDependencies(ctx *plugin.Context, runtime *workspace.ProjectRuntimeInfo, main string) error {
+	if runtime.Name() == "" {
+		return nil
+	}
+
 	// First make sure the language plugin is present.  We need this to load the required resource plugins.
 	// TODO: we need to think about how best to version this.  For now, it always picks the latest.
-	lang, err := ctx.Host.LanguageRuntime(runtime.Name())
+	lang, err := ctx.Host.LanguageRuntime(ctx, runtime.Name())
 	if err != nil {
 		return fmt.Errorf("failed to load language plugin %s: %w", runtime.Name(), err)
 	}
@@ -67,15 +73,21 @@ func InstallPackagesFromProject(
 	ctx context.Context, proj workspace.BaseProject, root string, registry registry.Registry,
 	parallelism int, useLanguageVersionTools bool,
 	stdout, stderr io.Writer, e env.Env,
-) error {
+) (packageinstallation.State, error) {
 	d := diag.DefaultSink(stdout, stderr, diag.FormatOptions{
 		Color: utilCmdutil.GetGlobalColorization(),
 	})
-	pctx, err := plugin.NewContext(ctx, d, d, nil, nil, root, nil, false, nil, schema.NewLoaderServerFromHost)
+	pluginHost, err := pkghost.New(context.WithoutCancel(ctx), d, d, nil, pkgWorkspace.EnsureLanguageInstalled,
+		schema.NewLoaderServerFromContext, convert.NewMapperServerFromContext,
+		packageworkspace.NewResolverServer(registry))
 	if err != nil {
-		return err
+		return packageinstallation.State{}, err
 	}
-	ws := packageworkspace.New(pluginstorage.Instance, pkgWorkspace.Instance, pctx.Host, stdout, stderr, nil,
+	pctx, err := plugin.NewContext(ctx, d, d, pluginHost, nil, root, nil, false, nil)
+	if err != nil {
+		return packageinstallation.State{}, errors.Join(err, pluginHost.Close())
+	}
+	ws := packageworkspace.New(pluginstorage.Instance, pkgWorkspace.Instance, pctx, stdout, stderr, nil,
 		packageworkspace.Options{
 			UseLanguageVersionTools: useLanguageVersionTools,
 		})
@@ -87,10 +99,10 @@ func InstallPackagesFromProject(
 		},
 		Concurrency: parallelism,
 	}
-	err = packageinstallation.InstallProjectPlugins(ctx, proj, root, opts, registry, ws)
+	continuation, err := packageinstallation.InstallProjectPlugins(ctx, proj, root, opts, registry, ws)
 	if e := (packageinstallation.ErrorCyclicDependencies{}); errors.As(err, &e) {
 		err = cmdDiag.FormatCyclicInstallError(ctx, e, root)
 	}
 
-	return errors.Join(err, pctx.Close())
+	return continuation, errors.Join(err, pctx.Close(), pluginHost.Close())
 }

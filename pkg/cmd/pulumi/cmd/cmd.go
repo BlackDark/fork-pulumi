@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"runtime"
 	"strings"
@@ -32,8 +33,9 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/cloud"
 	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/ui"
 	"github.com/pulumi/pulumi/pkg/v3/engine"
+	"github.com/pulumi/pulumi/pkg/v3/resource/stack/snapshot"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/snapshot"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/cmdutil"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/env"
@@ -79,7 +81,7 @@ func processCmdErrors(ctx context.Context, err error, stderr io.Writer) error {
 		return result.BailError(err)
 	}
 
-	if errors.Is(err, backenderr.LoginRequiredError{}) || errors.Is(err, httpstate.ErrUnauthorized) {
+	if isAuthRequiredError(err) {
 		if message := agentauth.AuthRequiredMessage(time.Now()); message != "" {
 			_, printErr := fmt.Fprint(stderr, message)
 			contract.IgnoreError(printErr)
@@ -104,6 +106,13 @@ func processCmdErrors(ctx context.Context, err error, stderr io.Writer) error {
 
 	// In all other cases, return the unexpected error as-is for generic handling.
 	return err
+}
+
+func isAuthRequiredError(err error) bool {
+	var apiErr *apitype.ErrorResponse
+	return errors.Is(err, backenderr.LoginRequiredError{}) ||
+		errors.Is(err, httpstate.ErrUnauthorized) ||
+		errors.As(err, &apiErr) && apiErr.Code == http.StatusUnauthorized
 }
 
 // A type-specific handler for engine.DecryptErrors that prints out help text
@@ -158,7 +167,7 @@ We would appreciate a report: https://github.com/pulumi/pulumi/issues/
 
 	if sie.Op == snapshot.SnapshotIntegrityRead && sie.Metadata == nil {
 		message.WriteString(`
-NOTE: This error occurred while reading a snaphot. This error was introduced by
+NOTE: This error occurred while reading a snapshot. This error was introduced by
 a previous operation when it wrote the snapshot. If you have details about that
 operation, please include them in your report as well.
 `)

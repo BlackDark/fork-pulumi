@@ -35,10 +35,6 @@ func NewDeploymentCmd(ws pkgWorkspace.Context) *cobra.Command {
 
 	constrictor.AttachArguments(cmd, constrictor.NoArgs)
 
-	cmd.PersistentFlags().StringVar(
-		&stackDeploymentConfigFile, "config-file", "",
-		"Override the file name where the deployment settings are specified. Default is Pulumi.[stack].deploy.yaml")
-
 	cmd.AddCommand(newDeploymentSettingsCmd())
 	cmd.AddCommand(newDeploymentRunCmd(ws))
 	cmd.AddCommand(newDeploymentListCmd())

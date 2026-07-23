@@ -49,16 +49,15 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 )
 
-var ConfigFile string
-
 func LoadProjectStack(
 	ctx context.Context,
 	sink diag.Sink,
 	project *workspace.Project,
 	stack backend.Stack,
+	configFile string,
 ) (*workspace.ProjectStack, error) {
-	if ConfigFile != "" {
-		return workspace.LoadProjectStack(sink, project, ConfigFile)
+	if configFile != "" {
+		return workspace.LoadProjectStack(sink, project, configFile)
 	}
 	project, configFilePath, err := workspace.DetectProjectStackPath(stack.Ref().Name().Q())
 	if err != nil {
@@ -73,21 +72,24 @@ func LoadProjectStack(
 		if err == nil {
 			sink.Warningf(
 				diag.Message("", "config file %s exists but will be ignored because this stack uses remote config"),
-				configFilePath)
+				configFilePath,
+			)
 		}
 		return stack.LoadRemoteConfig(ctx, project)
 	}
 	return workspace.LoadProjectStack(sink, project, configFilePath)
 }
 
-func SaveProjectStack(ctx context.Context, stack backend.Stack, ps *workspace.ProjectStack) error {
-	if ConfigFile != "" {
-		return ps.Save(ConfigFile)
+func SaveProjectStack(
+	ctx context.Context, stack backend.Stack, ps *workspace.ProjectStack, configFile string,
+) error {
+	if configFile != "" {
+		return ps.Save(configFile)
 	}
 	if stack.ConfigLocation().IsRemote {
 		return stack.SaveRemoteConfig(ctx, ps)
 	}
-	return workspace.SaveProjectStack(stack.Ref().Name().Q(), ps)
+	return pkgWorkspace.SaveProjectStack(stack.Ref().Name().Q(), ps)
 }
 
 type LoadOption int
@@ -119,14 +121,14 @@ func (o LoadOption) SetCurrent() bool {
 // the workspace is returned.  If no stack with either the given name, or a currently selected stack, exists,
 // and we are in an interactive terminal, the user will be prompted to create a new stack.
 func RequireStack(ctx context.Context, sink diag.Sink, ws pkgWorkspace.Context, lm cmdBackend.LoginManager,
-	stackName string, lopt LoadOption, opts display.Options,
+	stackName string, lopt LoadOption, opts display.Options, configFile string,
 ) (backend.Stack, error) {
 	if stackName == "" {
-		return requireCurrentStack(ctx, sink, ws, lm, lopt, opts)
+		return requireCurrentStack(ctx, sink, ws, lm, lopt, opts, configFile)
 	}
 
 	// Try to read the current project
-	project, root, err := ws.ReadProject()
+	project, root, err := ws.ReadProject("")
 	if err != nil && !errors.Is(err, workspace.ErrProjectNotFound) {
 		return nil, err
 	}
@@ -161,7 +163,7 @@ func RequireStack(ctx context.Context, sink diag.Sink, ws pkgWorkspace.Context, 
 			return nil, err
 		}
 
-		return CreateStack(ctx, sink, ws, b, stackRef, root, nil, lopt.SetCurrent(), "", false)
+		return CreateStack(ctx, sink, ws, b, stackRef, root, nil, lopt.SetCurrent(), "", false, configFile)
 	}
 
 	return nil, backenderr.StackNotFoundError{StackName: stackName}
@@ -169,10 +171,10 @@ func RequireStack(ctx context.Context, sink diag.Sink, ws pkgWorkspace.Context, 
 
 func requireCurrentStack(
 	ctx context.Context, sink diag.Sink, ws pkgWorkspace.Context,
-	lm cmdBackend.LoginManager, lopt LoadOption, opts display.Options,
+	lm cmdBackend.LoginManager, lopt LoadOption, opts display.Options, configFile string,
 ) (backend.Stack, error) {
 	// Try to read the current project
-	project, _, err := ws.ReadProject()
+	project, _, err := ws.ReadProject("")
 	if err != nil && !errors.Is(err, workspace.ErrProjectNotFound) {
 		return nil, err
 	}
@@ -190,13 +192,13 @@ func requireCurrentStack(
 	}
 
 	// If no current stack exists, and we are interactive, prompt to select or create one.
-	return ChooseStack(ctx, sink, ws, b, lopt, opts)
+	return ChooseStack(ctx, sink, ws, b, lopt, opts, configFile)
 }
 
 // ChooseStack will prompt the user to choose amongst the full set of stacks in the given backend.  If offerNew is
 // true, then the option to create an entirely new stack is provided and will create one as desired.
 func ChooseStack(ctx context.Context, sink diag.Sink, ws pkgWorkspace.Context,
-	b backend.Backend, lopt LoadOption, opts display.Options,
+	b backend.Backend, lopt LoadOption, opts display.Options, configFile string,
 ) (backend.Stack, error) {
 	lopt ^= SetCurrent
 	// Prepare our error in case we need to issue it.  Bail early if we're not interactive.
@@ -210,7 +212,7 @@ func ChooseStack(ctx context.Context, sink diag.Sink, ws pkgWorkspace.Context,
 		return nil, errors.New(chooseStackErr)
 	}
 
-	proj, root, err := ws.ReadProject()
+	proj, root, err := ws.ReadProject("")
 	if err != nil {
 		return nil, err
 	}
@@ -304,7 +306,7 @@ func ChooseStack(ctx context.Context, sink diag.Sink, ws pkgWorkspace.Context,
 			return nil, parseErr
 		}
 
-		return CreateStack(ctx, sink, ws, b, stackRef, root, nil, lopt.SetCurrent(), "", false)
+		return CreateStack(ctx, sink, ws, b, stackRef, root, nil, lopt.SetCurrent(), "", false, configFile)
 	}
 
 	// With the stack name selected, look it up from the backend.
@@ -334,22 +336,28 @@ func ChooseStack(ctx context.Context, sink diag.Sink, ws pkgWorkspace.Context,
 // InitStack creates the stack.
 func InitStack(
 	ctx context.Context, sink diag.Sink, ws pkgWorkspace.Context, b backend.Backend, stackName string,
-	root string, setCurrent bool, secretsProvider string, useRemoteConfig bool,
+	root string, setCurrent bool, secretsProvider string, useRemoteConfig bool, configFile string,
 ) (backend.Stack, error) {
 	stackRef, err := b.ParseStackReference(stackName)
 	if err != nil {
 		return nil, err
 	}
-	return CreateStack(ctx, sink, ws, b, stackRef, root, nil, setCurrent, secretsProvider, useRemoteConfig)
+	return CreateStack(ctx, sink, ws, b, stackRef, root, nil, setCurrent, secretsProvider, useRemoteConfig, configFile)
 }
+
+// ErrSaveStackConfig wraps `SaveProjectStack` errors that occur in `CreateStack` after the
+// backend stack has already been successfully created. Callers can detect this case via
+// `errors.Is(err, ErrSaveStackConfig)` to know that the backend stack exists despite the error
+// (e.g. so they can clean it up).
+var ErrSaveStackConfig = errors.New("saving stack config")
 
 // CreateStack creates a stack with the given name, and optionally selects it as the current.
 func CreateStack(ctx context.Context, sink diag.Sink, ws pkgWorkspace.Context,
 	b backend.Backend, stackRef backend.StackReference,
 	root string, teams []string, setCurrent bool,
-	secretsProvider string, useRemoteConfig bool,
+	secretsProvider string, useRemoteConfig bool, configFile string,
 ) (backend.Stack, error) {
-	ps, needsSave, sm, err := createSecretsManagerForNewStack(ctx, sink, ws, b, stackRef, secretsProvider)
+	ps, needsSave, sm, err := createSecretsManagerForNewStack(ctx, sink, ws, b, stackRef, secretsProvider, configFile)
 	if err != nil {
 		return nil, fmt.Errorf("could not create secrets manager for new stack: %w", err)
 	}
@@ -418,9 +426,9 @@ func CreateStack(ctx context.Context, sink diag.Sink, ws pkgWorkspace.Context,
 
 	// Now that we've created the stack, we'll write out any necessary configuration changes.
 	if needsSave {
-		err = SaveProjectStack(ctx, stack, ps)
+		err = SaveProjectStack(ctx, stack, ps, configFile)
 		if err != nil {
-			return nil, fmt.Errorf("saving stack config: %w", err)
+			return nil, fmt.Errorf("%w: %w", ErrSaveStackConfig, err)
 		}
 	}
 
@@ -525,7 +533,8 @@ func SaveSnapshot(ctx context.Context, s backend.Stack, snapshot *deploy.Snapsho
 	if snapshot.PendingOperations != nil {
 		for _, op := range snapshot.PendingOperations {
 			msg := fmt.Sprintf(
-				"removing pending operation '%s' on '%s' from snapshot", op.Type, op.Resource.URN)
+				"removing pending operation '%s' on '%s' from snapshot", op.Type, op.Resource.URN,
+			)
 			cmdutil.Diag().Warningf(diag.Message(op.Resource.URN, msg))
 		}
 
@@ -553,7 +562,7 @@ func RequireCloudStack(
 ) (*client.Client, client.StackIdentifier, error) {
 	opts := display.Options{Color: cmdutil.GetGlobalColorization()}
 
-	s, err := RequireStack(ctx, sink, ws, lm, stackName, LoadOnly, opts)
+	s, err := RequireStack(ctx, sink, ws, lm, stackName, LoadOnly, opts, "")
 	if err != nil {
 		return nil, client.StackIdentifier{}, fmt.Errorf("resolving stack: %w", err)
 	}

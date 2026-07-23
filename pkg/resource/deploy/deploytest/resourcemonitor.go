@@ -23,8 +23,9 @@ import (
 	"time"
 
 	fxs "github.com/pgavlin/fx/v2/slices"
+	pkgresource "github.com/pulumi/pulumi/pkg/v3/resource"
+	"github.com/pulumi/pulumi/pkg/v3/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
@@ -120,7 +121,7 @@ func parseSourcePosition(raw string) (*pulumirpc.SourcePosition, error) {
 
 func marshalSourceInfo(
 	sourcePosition string,
-	stackTrace []resource.StackFrame,
+	stackTrace []pkgresource.StackFrame,
 ) (_ *pulumirpc.SourcePosition, _ *pulumirpc.StackTrace, err error) {
 	var pos *pulumirpc.SourcePosition
 	if sourcePosition != "" {
@@ -132,7 +133,9 @@ func marshalSourceInfo(
 
 	var trace *pulumirpc.StackTrace
 	if len(stackTrace) != 0 {
-		frames, err := fxs.TryCollect(fxs.MapUnpack(stackTrace, func(f resource.StackFrame) (*pulumirpc.StackFrame, error) {
+		frames, err := fxs.TryCollect(fxs.MapUnpack(stackTrace, func(
+			f pkgresource.StackFrame,
+		) (*pulumirpc.StackFrame, error) {
 			position, err := parseSourcePosition(f.SourcePosition)
 			if err != nil {
 				return nil, err
@@ -441,7 +444,7 @@ type ResourceOptions struct {
 	AliasSpecs              bool
 
 	SourcePosition         string
-	StackTrace             []resource.StackFrame
+	StackTrace             []pkgresource.StackFrame
 	ParentStackTraceHandle string
 
 	DisableSecrets            bool
@@ -537,6 +540,7 @@ func (rm *ResourceMonitor) RegisterResource(t tokens.Type, name string, custom b
 			Create: prepareTestTimeout(opts.CustomTimeouts.Create),
 			Update: prepareTestTimeout(opts.CustomTimeouts.Update),
 			Delete: prepareTestTimeout(opts.CustomTimeouts.Delete),
+			Read:   prepareTestTimeout(opts.CustomTimeouts.Read),
 		}
 	}
 
@@ -675,7 +679,7 @@ func (rm *ResourceMonitor) ReadResource(
 	provider,
 	version,
 	sourcePosition string,
-	stackTrace []resource.StackFrame,
+	stackTrace []pkgresource.StackFrame,
 	parentStackTraceHandle string,
 	packageRef string,
 ) (resource.URN, resource.PropertyMap, error) {
@@ -767,7 +771,7 @@ func (rm *ResourceMonitor) Call(
 	version string,
 	packageRef string,
 	sourcePosition string,
-	stackTrace []resource.StackFrame,
+	stackTrace []pkgresource.StackFrame,
 	parentStackTraceHandle string,
 ) (resource.PropertyMap, map[resource.PropertyKey][]resource.URN, []*pulumirpc.CheckFailure, error) {
 	sourcePos, stack, err := marshalSourceInfo(sourcePosition, stackTrace)
@@ -848,7 +852,7 @@ func (rm *ResourceMonitor) RegisterStackInvokeTransform(callback *pulumirpc.Call
 }
 
 func (rm *ResourceMonitor) RegisterPackage(pkg, version, downloadURL string, checksums map[string][]byte,
-	parameterization *pulumirpc.Parameterization,
+	parameterization, extension *pulumirpc.Parameterization,
 ) (string, error) {
 	resp, err := rm.resmon.RegisterPackage(context.Background(), &pulumirpc.RegisterPackageRequest{
 		Name:             pkg,
@@ -856,6 +860,7 @@ func (rm *ResourceMonitor) RegisterPackage(pkg, version, downloadURL string, che
 		DownloadUrl:      downloadURL,
 		Checksums:        checksums,
 		Parameterization: parameterization,
+		Extension:        extension,
 	})
 	if err != nil {
 		return "", err

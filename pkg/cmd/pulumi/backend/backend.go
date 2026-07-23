@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 
 	"github.com/pulumi/pulumi/pkg/v3/backend"
@@ -25,22 +26,18 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/backend/diy"
 	pkgWorkspace "github.com/pulumi/pulumi/pkg/v3/workspace"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/env"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/util/agentdetect"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/cmdutil"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/util/logging"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 )
 
-// BackendInstance is used to inject a backend mock from tests.
-var BackendInstance backend.Backend
-
 func IsDIYBackend(ws pkgWorkspace.Context, opts display.Options) (bool, error) {
-	if BackendInstance != nil {
-		return false, nil
+	cwd, err := os.Getwd()
+	if err != nil {
+		return false, fmt.Errorf("getting current working directory: %w", err)
 	}
 
 	// Try to read the current project
-	project, _, err := ws.ReadProject()
+	project, _, err := ws.ReadProject(cwd)
 	if err != nil && !errors.Is(err, workspace.ErrProjectNotFound) {
 		return false, err
 	}
@@ -56,15 +53,11 @@ func IsDIYBackend(ws pkgWorkspace.Context, opts display.Options) (bool, error) {
 func NonInteractiveCurrentBackend(
 	ctx context.Context, ws pkgWorkspace.Context, lm LoginManager, project *workspace.Project,
 ) (backend.Backend, error) {
-	if BackendInstance != nil {
-		return BackendInstance, nil
-	}
-
-	url, err := getCurrentCloudURL(ws, project)
+	url, err := pkgWorkspace.GetCurrentCloudURLWithAgentFallback(ws, env.Global(), project)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("could not get cloud url: %w", err)
 	}
-	logging.V(7).Infof("Current cloud URL: %q", url)
+	slog.InfoContext(ctx, "Current cloud URL", "url", url)
 
 	// Only set current if we don't currently have a cloud URL set.
 	return lm.Current(ctx, ws, cmdutil.Diag(), url, project, url == "")
@@ -74,53 +67,13 @@ func CurrentBackend(
 	ctx context.Context, ws pkgWorkspace.Context, lm LoginManager, project *workspace.Project,
 	opts display.Options,
 ) (backend.Backend, error) {
-	if BackendInstance != nil {
-		return BackendInstance, nil
-	}
-
-	url, err := getCurrentCloudURL(ws, project)
+	url, err := pkgWorkspace.GetCurrentCloudURLWithAgentFallback(ws, env.Global(), project)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("could not get cloud url: %w", err)
 	}
-	logging.V(7).Infof("Current cloud URL: %q", url)
+	slog.InfoContext(ctx, "Current cloud URL", "url", url)
 	insecure := pkgWorkspace.GetCloudInsecure(ws, url)
 
 	// Only set current if we don't currently have a cloud URL set.
 	return lm.Login(ctx, ws, cmdutil.Diag(), url, project, url == "", insecure, opts.Color)
-}
-
-// getCurrentCloudURL returns the active cloud URL, using the shared agent
-// credentials as a fallback when an agent cannot read the default credentials.
-func getCurrentCloudURL(ws pkgWorkspace.Context, project *workspace.Project) (string, error) {
-	url, err := pkgWorkspace.GetCurrentCloudURL(ws, env.Global(), project)
-	if err == nil {
-		return url, nil
-	}
-
-	agent := agentdetect.Detect(os.Getenv)
-	if agent == "" || hasExplicitPulumiPathEnv() {
-		logging.V(7).Infof("Could not get cloud URL from default credentials without agent fallback: %v", err)
-		return "", fmt.Errorf("could not get cloud url: %w", err)
-	}
-
-	logging.V(7).Infof(
-		"Could not get cloud URL from default credentials in agent mode (%s); checking shared agent credentials: %v",
-		agent, err)
-	agentCreds, agentErr := workspace.GetAgentStoredCredentials()
-	if agentErr != nil {
-		return "", fmt.Errorf("could not get cloud url from agent credentials: %w", errors.Join(err, agentErr))
-	}
-	if agentCreds.Current != "" {
-		logging.V(7).Infof("Using current cloud URL %q from shared agent credentials", agentCreds.Current)
-	} else {
-		logging.V(7).Infof("No current cloud URL found in shared agent credentials")
-	}
-
-	return agentCreds.Current, nil
-}
-
-// hasExplicitPulumiPathEnv reports whether the user explicitly selected a
-// Pulumi credential or home path, disabling implicit agent fallback paths.
-func hasExplicitPulumiPathEnv() bool {
-	return os.Getenv(workspace.PulumiCredentialsPathEnvVar) != "" || os.Getenv(env.Home.Var().Name()) != ""
 }

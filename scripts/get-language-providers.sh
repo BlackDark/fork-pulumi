@@ -48,15 +48,16 @@ download_release() {
 }
 
 # Each entry is "lang tag [owner]". The owner defaults to "pulumi" when omitted.
+#
+# Note: the HCL language runtime is no longer bundled. Its pinned version and download URL
+# live in pkg/util/plugin.go (knownLanguageRuntimes) and the CLI fetches it on demand.
 LANGUAGES=(
   # renovate: datasource=github-releases depName=pulumi/pulumi-dotnet
-  "dotnet v3.106.2"
+  "dotnet v3.107.3"
   # renovate: datasource=github-releases depName=pulumi/pulumi-java
-  "java v1.27.0"
+  "java v1.32.0"
   # renovate: datasource=github-releases depName=pulumi/pulumi-yaml
-  "yaml v1.35.0"
-  # renovate: datasource=github-releases depName=pulumi-labs/pulumi-hcl
-  "hcl v0.4.0 pulumi-labs"
+  "yaml v1.37.0"
 )
 
 for i in "${LANGUAGES[@]}"; do

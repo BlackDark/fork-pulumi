@@ -22,9 +22,8 @@ import (
 	"github.com/blang/semver"
 
 	"github.com/pulumi/pulumi/pkg/v3/codegen/schema"
+	"github.com/pulumi/pulumi/pkg/v3/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 )
 
 // Config provider is a small provider to test things related to provider configuration and explicit provider resources.
@@ -45,10 +44,6 @@ func (p *ConfigProvider) Configure(
 	context.Context, plugin.ConfigureRequest,
 ) (plugin.ConfigureResponse, error) {
 	return plugin.ConfigureResponse{}, nil
-}
-
-func (p *ConfigProvider) Pkg() tokens.Package {
-	return "config"
 }
 
 func (p *ConfigProvider) GetSchema(
@@ -84,7 +79,7 @@ func (p *ConfigProvider) GetSchema(
 			Required:  []string{"name"},
 		},
 		PluginDownloadURL: "http://example.com",
-		Provider: schema.ResourceSpec{
+		Provider: &schema.ResourceSpec{
 			ObjectTypeSpec: schema.ObjectTypeSpec{
 				Type: "object",
 				Properties: map[string]schema.PropertySpec{

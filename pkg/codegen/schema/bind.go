@@ -27,16 +27,15 @@ import (
 	"maps"
 	"math"
 	"net/url"
-	"os"
 	"path"
 	"regexp"
 	"slices"
 	"sort"
 	"strings"
+	"unicode"
 
 	"github.com/blang/semver"
 	"github.com/hashicorp/hcl/v2"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/santhosh-tekuri/jsonschema/v5"
@@ -77,9 +76,13 @@ func memberPath(section, token string, rest ...string) string {
 }
 
 func errorf(path, message string, args ...any) *hcl.Diagnostic {
-	contract.Requiref(path != "", "path", "must not be empty")
-
-	summary := path + ": " + fmt.Sprintf(message, args...)
+	msg := fmt.Sprintf(message, args...)
+	var summary string
+	if path != "" {
+		summary = path + ": " + msg
+	} else {
+		summary = msg
+	}
 	return &hcl.Diagnostic{
 		Severity: hcl.DiagError,
 		Summary:  summary,
@@ -94,6 +97,15 @@ func warningf(path, message string, args ...any) *hcl.Diagnostic {
 		Severity: hcl.DiagWarning,
 		Summary:  summary,
 	}
+}
+
+func validatePrintableName(path, kind, name string) *hcl.Diagnostic {
+	for _, r := range name {
+		if !unicode.IsPrint(r) || unicode.IsSpace(r) {
+			return errorf(path, "%s must contain only printable, non-whitespace characters (found U+%04X)", kind, r)
+		}
+	}
+	return nil
 }
 
 func validateSpec(spec PackageSpec) (hcl.Diagnostics, error) {
@@ -146,15 +158,20 @@ func validateSpec(spec PackageSpec) (hcl.Diagnostics, error) {
 //     diagnostic. Until we have line/column information, we use JSON pointers to the offending entities. These pointers
 //     are passed around using `path` parameters. The `errorf` function is provided as a utility to easily create a
 //     diagnostic error that is appropriately tagged with a JSON pointer.
-func bindSpec(spec PackageSpec, languages map[string]Language, loader Loader,
+func bindSpec(ctx context.Context, spec PackageSpec, languages map[string]Language, loader Loader,
 	validate bool,
 	options ValidationOptions,
 ) (*Package, hcl.Diagnostics, error) {
+	ctx, span := schemaTracer.Start(ctx, "schema.BindSpec")
+	defer span.End()
+
 	var diags hcl.Diagnostics
 
 	// Validate the package against the metaschema.
 	if validate {
+		_, vspan := schemaTracer.Start(ctx, "schema.validateSpec")
 		validationDiags, err := validateSpec(spec)
+		vspan.End()
 		diags = diags.Extend(validationDiags)
 		if err != nil {
 			return nil, diags, fmt.Errorf("validating spec: %w", err)
@@ -166,7 +183,6 @@ func bindSpec(spec PackageSpec, languages map[string]Language, loader Loader,
 	if err != nil {
 		return nil, diags, err
 	}
-	defer contract.IgnoreClose(types)
 
 	diags = diags.Extend(spec.validateTypeTokens())
 
@@ -183,19 +199,25 @@ func bindSpec(spec PackageSpec, languages map[string]Language, loader Loader,
 		return nil, diags, err
 	}
 
+	_, rspan := schemaTracer.Start(ctx, "schema.bindResources")
 	provider, resources, resourceDiags, err := types.finishResources(sortedKeys(spec.Resources), options)
+	rspan.End()
 	diags = diags.Extend(resourceDiags)
 	if err != nil {
 		return nil, diags, err
 	}
 
+	_, fspan := schemaTracer.Start(ctx, "schema.bindFunctions")
 	functions, functionDiags, err := types.finishFunctions(sortedKeys(spec.Functions), options)
+	fspan.End()
 	diags = diags.Extend(functionDiags)
 	if err != nil {
 		return nil, diags, err
 	}
 
+	_, tspan := schemaTracer.Start(ctx, "schema.bindTypes")
 	typeList, typeDiags, err := types.finishTypes(sortedKeys(spec.Types), options)
+	tspan.End()
 	diags = diags.Extend(typeDiags)
 	if err != nil {
 		return nil, diags, err
@@ -203,10 +225,21 @@ func bindSpec(spec PackageSpec, languages map[string]Language, loader Loader,
 
 	diags = diags.Extend(validateNoRequiredObjectCycles(typeList))
 
+	if spec.Parameterization != nil && spec.ExtensionParameterization != nil {
+		diags = diags.Append(errorf("#/parameterization",
+			"a package may declare parameterization or extensionParameterization, not both"))
+	}
+
 	parameterization, parameterizationDiags := bindParameterization(spec.Parameterization)
 	diags = diags.Extend(parameterizationDiags)
 
+	extensionParameterization, extDiags := bindExtensionParameterization(spec.ExtensionParameterization)
+	diags = diags.Extend(extDiags)
+
 	diags = diags.Extend(checkDuplicates(spec.Resources, spec.Functions, types.pkg.TokenToModule))
+
+	// Now we've bound everything we can do a pass over the Descriptions and Comments to check they have valid doc refs.
+	diags = diags.Extend(checkDocRefs(types, spec))
 
 	pkg := types.pkg
 	pkg.Config = config
@@ -215,6 +248,7 @@ func bindSpec(spec PackageSpec, languages map[string]Language, loader Loader,
 	pkg.Resources = resources
 	pkg.Functions = functions
 	pkg.Parameterization = parameterization
+	pkg.ExtensionParameterization = extensionParameterization
 	pkg.Dependencies = spec.Dependencies
 	pkg.resourceTable = types.resourceDefs
 	pkg.functionTable = types.functionDefs
@@ -222,6 +256,9 @@ func bindSpec(spec PackageSpec, languages map[string]Language, loader Loader,
 	pkg.resourceTypeTable = types.resources
 	if err := pkg.ImportLanguages(languages); err != nil {
 		return nil, nil, err
+	}
+	pkg.interpretPulumiRefs = func(description string, resolver PulumiRefResolver) (string, error) {
+		return interpretPulumiRefsInDescription(description, types, resolver)
 	}
 	return pkg, diags, nil
 }
@@ -232,6 +269,7 @@ func bindSpec(spec PackageSpec, languages map[string]Language, loader Loader,
 func newBinder(info PackageInfoSpec, spec specSource, loader Loader,
 	bindTo PackageReference,
 ) (*types, hcl.Diagnostics, error) {
+	contract.Requiref(loader != nil, "loader", "must not be nil")
 	var diags hcl.Diagnostics
 
 	// Validate that there is a name
@@ -273,49 +311,52 @@ func newBinder(info PackageInfoSpec, spec specSource, loader Loader,
 		supportPack = info.Meta.SupportPack
 	}
 	// Parameterized packages must always be built in SupportPack mode.
-	if info.Parameterization != nil {
+	if info.Parameterization != nil || info.ExtensionParameterization != nil {
 		supportPack = true
+	}
+
+	if info.Parameterization != nil && info.ExtensionParameterization != nil {
+		diags = diags.Append(errorf("#/parameterization",
+			"a package may declare parameterization or extensionParameterization, not both"))
+	}
+
+	// An extension parameterization rides on the base provider, so it must not
+	// declare a provider of its own. GetResourceSpec reports the provider present
+	// only when an explicit block is set.
+	if info.ExtensionParameterization != nil {
+		if _, hasProvider, provErr := spec.GetResourceSpec("pulumi:providers:" + info.Name); provErr == nil && hasProvider {
+			diags = diags.Append(errorf("#/provider",
+				"a package with an extensionParameterization may not declare a provider"))
+		}
 	}
 
 	parameterization, parameterizationDiagnostics := bindParameterization(info.Parameterization)
 	diags = diags.Extend(parameterizationDiagnostics)
 
+	extensionParameterization, extDiags := bindExtensionParameterization(info.ExtensionParameterization)
+	diags = diags.Extend(extDiags)
+
 	pkg := &Package{
-		SupportPack:         supportPack,
-		moduleFormat:        moduleFormatRegexp,
-		Name:                info.Name,
-		DisplayName:         info.DisplayName,
-		Version:             version,
-		Description:         info.Description,
-		Keywords:            info.Keywords,
-		Homepage:            info.Homepage,
-		License:             info.License,
-		Attribution:         info.Attribution,
-		Repository:          info.Repository,
-		PluginDownloadURL:   info.PluginDownloadURL,
-		Publisher:           info.Publisher,
-		Namespace:           info.Namespace,
-		Dependencies:        info.Dependencies,
-		AllowedPackageNames: info.AllowedPackageNames,
-		LogoURL:             info.LogoURL,
-		Language:            language,
-		Parameterization:    parameterization,
-	}
-
-	// We want to use the same loader instance for all referenced packages, so only instantiate the loader if the
-	// reference is nil.
-	var loadCtx io.Closer
-	if loader == nil {
-		cwd, err := os.Getwd()
-		if err != nil {
-			return nil, nil, err
-		}
-		ctx, err := plugin.NewContext(context.TODO(), nil, nil, nil, nil, cwd, nil, false, nil, NewLoaderServerFromHost)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		loader, loadCtx = NewPluginLoader(ctx.Host), ctx
+		SupportPack:               supportPack,
+		moduleFormat:              moduleFormatRegexp,
+		Name:                      info.Name,
+		DisplayName:               info.DisplayName,
+		Version:                   version,
+		Description:               info.Description,
+		Keywords:                  info.Keywords,
+		Homepage:                  info.Homepage,
+		License:                   info.License,
+		Attribution:               info.Attribution,
+		Repository:                info.Repository,
+		PluginDownloadURL:         info.PluginDownloadURL,
+		Publisher:                 info.Publisher,
+		Namespace:                 info.Namespace,
+		Dependencies:              info.Dependencies,
+		AllowedPackageNames:       info.AllowedPackageNames,
+		LogoURL:                   info.LogoURL,
+		Language:                  language,
+		Parameterization:          parameterization,
+		ExtensionParameterization: extensionParameterization,
 	}
 
 	// Create a type binder.
@@ -323,7 +364,6 @@ func newBinder(info PackageInfoSpec, spec specSource, loader Loader,
 		pkg:          pkg,
 		spec:         spec,
 		loader:       loader,
-		loadCtx:      loadCtx,
 		typeDefs:     map[string]Type{},
 		functionDefs: map[string]*Function{},
 		resourceDefs: map[string]*Resource{},
@@ -341,7 +381,7 @@ func newBinder(info PackageInfoSpec, spec specSource, loader Loader,
 	return types, diags, nil
 }
 
-// Options that affect the validation of the packgae schema.
+// Options that affect the validation of the package schema.
 type ValidationOptions struct {
 	// Internal flag set to allow the builtin pulumi package to bind.
 	AllowPulumiPackage      bool
@@ -351,16 +391,25 @@ type ValidationOptions struct {
 // BindSpec converts a serializable PackageSpec into a Package. Any semantic errors encountered during binding are
 // contained in the returned diagnostics. The returned error is only non-nil if a fatal error was encountered.
 func BindSpec(spec PackageSpec, loader Loader, options ValidationOptions) (*Package, hcl.Diagnostics, error) {
-	return bindSpec(spec, nil, loader, true, options)
+	return BindSpecWithContext(context.Background(), spec, loader, options)
+}
+
+// BindSpecWithContext is [BindSpec] with an explicit context that parents the OpenTelemetry spans emitted while
+// binding the package.
+func BindSpecWithContext(
+	ctx context.Context, spec PackageSpec, loader Loader, options ValidationOptions,
+) (*Package, hcl.Diagnostics, error) {
+	return bindSpec(ctx, spec, nil, loader, true, options)
 }
 
 // ImportSpec converts a serializable PackageSpec into a Package. Unlike BindSpec, ImportSpec does not validate its
 // input against the Pulumi package metaschema. ImportSpec should only be used to load packages that are assumed to be
 // well-formed (e.g. packages referenced for program code generation or by a root package being used for SDK
 // generation). BindSpec should be used to load and validate a package spec prior to generating its SDKs.
-func ImportSpec(spec PackageSpec, languages map[string]Language, options ValidationOptions) (*Package, error) {
-	// Call the internal implementation that includes a loader parameter.
-	pkg, diags, err := bindSpec(spec, languages, nil, false, options)
+func ImportSpec(
+	spec PackageSpec, languages map[string]Language, loader Loader, options ValidationOptions,
+) (*Package, error) {
+	pkg, diags, err := bindSpec(context.Background(), spec, languages, loader, false, options)
 	if err != nil {
 		return nil, err
 	}
@@ -374,9 +423,19 @@ func ImportSpec(spec PackageSpec, languages map[string]Language, options Validat
 // PartialPackage loads and binds its members on-demand rather than at import time. This is useful when the entire
 // contents of a package are not needed (e.g. for referenced packages).
 func ImportPartialSpec(spec PartialPackageSpec, languages map[string]Language, loader Loader) (*PartialPackage, error) {
+	return ImportPartialSpecWithContext(context.Background(), spec, languages, loader)
+}
+
+func ImportPartialSpecWithContext(
+	ctx context.Context, spec PartialPackageSpec, languages map[string]Language, loader Loader,
+) (*PartialPackage, error) {
+	_, span := schemaTracer.Start(ctx, "schema.ImportPartialSpec")
+	defer span.End()
+
 	pkg := &PartialPackage{
 		spec:      &spec,
 		languages: languages,
+		ctx:       ctx,
 	}
 	types, diags, err := newBinder(spec.PackageInfoSpec, partialPackageSpecSource{&spec}, loader, pkg)
 	if err != nil {
@@ -411,7 +470,14 @@ func (s packageSpecSource) GetFunctionSpec(token string) (FunctionSpec, bool, er
 
 func (s packageSpecSource) GetResourceSpec(token string) (ResourceSpec, bool, error) {
 	if token == "pulumi:providers:"+s.spec.Name {
-		return s.spec.Provider, true, nil
+		if s.spec.Provider != nil {
+			return *s.spec.Provider, true, nil
+		}
+		// Extension parameterizations have no provider.
+		if s.spec.ExtensionParameterization != nil {
+			return ResourceSpec{}, false, nil
+		}
+		return ResourceSpec{}, true, nil
 	}
 	spec, ok := s.spec.Resources[token]
 	return spec, ok, nil
@@ -450,6 +516,13 @@ func (s partialPackageSpecSource) GetFunctionSpec(token string) (FunctionSpec, b
 func (s partialPackageSpecSource) GetResourceSpec(token string) (ResourceSpec, bool, error) {
 	var rawSpec json.RawMessage
 	if token == "pulumi:providers:"+s.spec.Name {
+		if len(s.spec.Provider) == 0 {
+			// Extension parameterizations have no provider.
+			if s.spec.ExtensionParameterization != nil {
+				return ResourceSpec{}, false, nil
+			}
+			return ResourceSpec{}, true, nil
+		}
 		rawSpec = s.spec.Provider
 	} else {
 		raw, ok := s.spec.Resources[token]
@@ -469,10 +542,9 @@ func (s partialPackageSpecSource) GetResourceSpec(token string) (ResourceSpec, b
 // types facilitates interning (only storing a single reference to an object) during schema processing. The fields
 // correspond to fields in the schema, and are populated during the binding process.
 type types struct {
-	pkg     *Package
-	spec    specSource
-	loader  Loader
-	loadCtx io.Closer
+	pkg    *Package
+	spec   specSource
+	loader Loader
 
 	typeDefs     map[string]Type      // objects and enums
 	functionDefs map[string]*Function // function definitions
@@ -488,13 +560,6 @@ type types struct {
 
 	// A pointer to the package reference that `types` is a part of if it exists.
 	bindToReference PackageReference
-}
-
-func (t *types) Close() error {
-	if t.loadCtx != nil {
-		return t.loadCtx.Close()
-	}
-	return nil
 }
 
 // The package which bound types will link back to.
@@ -557,7 +622,13 @@ func (spec *PackageSpec) validateTypeToken(
 
 	modules, ok := allowedNameSpecs[parts[0]]
 	if !ok {
-		err := errorf(path, "invalid token '%s' (must have package name '%s')", token, spec.Name)
+		// Extension tokens must use the base provider's namespace, not the
+		// extension's own name, so point the author at the base.
+		expectedName := spec.Name
+		if spec.ExtensionParameterization != nil {
+			expectedName = spec.ExtensionParameterization.BaseProvider.Name
+		}
+		err := errorf(path, "invalid token '%s' (must have package name '%s')", token, expectedName)
 		diags = diags.Append(err)
 	}
 	if (parts[1] == "" || strings.EqualFold(parts[1], "index")) && strings.EqualFold(parts[2], "provider") {
@@ -585,9 +656,7 @@ func (spec *PackageSpec) validateTypeToken(
 	}
 
 	if strings.HasPrefix(moduleName, "index/") {
-		// TODO: We want this to be an error really, but for now warn about it to see if any users comment about it. We
-		// know at least aws-native needs to be updated to handle it.
-		err := warningf(path, "invalid token '%s' (nested modules under index are not allowed)", token)
+		err := errorf(path, "invalid token '%s' (nested modules under index are not allowed)", token)
 		diags = diags.Append(err)
 	}
 	if modules != nil && !slices.Contains(modules, parts[1]) {
@@ -600,7 +669,16 @@ func (spec *PackageSpec) validateTypeToken(
 // This is for validating non-reference type tokens.
 func (spec *PackageSpec) validateTypeTokens() hcl.Diagnostics {
 	var diags hcl.Diagnostics
-	allowedNameSpecs := map[string][]string{spec.Name: nil}
+	allowedNameSpecs := map[string][]string{}
+	if spec.ExtensionParameterization != nil {
+		// Extension resources are served at runtime by the base provider, and the
+		// whole base->extension resolution path is keyed on the base namespace, so
+		// their tokens must use the base provider's name — not the extension's own
+		// (renamed-SDK) name.
+		allowedNameSpecs[spec.ExtensionParameterization.BaseProvider.Name] = nil
+	} else {
+		allowedNameSpecs[spec.Name] = nil
+	}
 	for _, prefix := range spec.AllowedPackageNames {
 		allowedNameSpecs[prefix] = nil
 	}
@@ -682,11 +760,11 @@ func (t *types) parseTypeSpecRef(refPath, ref string) (typeSpecRef, hcl.Diagnost
 	}
 
 	var kind, token string
-	slash := strings.Index(fragment, "/")
-	if slash == -1 {
+	before, after, ok := strings.Cut(fragment, "/")
+	if !ok {
 		kind = fragment
 	} else {
-		kind, token = fragment[:slash], fragment[slash+1:]
+		kind, token = before, after
 	}
 
 	var diagnostics hcl.Diagnostics
@@ -889,6 +967,9 @@ func (t *types) bindTypeDef(token string, options ValidationOptions) (Type, hcl.
 
 	var diags hcl.Diagnostics
 	path := memberPath("types", token)
+	if diag := validatePrintableName(path, "type name", token); diag != nil {
+		diags = diags.Append(diag)
+	}
 	parts := strings.Split(token, ":")
 	if len(parts) == 3 {
 		name := parts[2]
@@ -1323,8 +1404,12 @@ func (t *types) bindProperties(path string, properties map[string]PropertySpec, 
 ) ([]*Property, map[string]*Property, hcl.Diagnostics, error) {
 	var diags hcl.Diagnostics
 	for name := range properties {
+		propertyPath := path + "/" + url.PathEscape(name)
+		if diag := validatePrintableName(propertyPath, "property name", name); diag != nil {
+			diags = diags.Append(diag)
+		}
 		if isReservedKeyword(name) {
-			diags = diags.Append(errorf(path+"/"+name, "%s", name+" is a reserved property name"))
+			diags = diags.Append(errorf(propertyPath, "%s", name+" is a reserved property name"))
 		}
 	}
 	if diags.HasErrors() {
@@ -1625,6 +1710,92 @@ func (t *types) finishTypes(tokens []string, options ValidationOptions) ([]Type,
 	slices.SortFunc(typeList, compareTypes)
 
 	return typeList, diags, nil
+}
+
+func checkDocRefs(types *types, spec PackageSpec) hcl.Diagnostics {
+	var diags hcl.Diagnostics
+	resolver := func(ref DocRef) (string, bool) { return "", false }
+
+	check := func(path, text string) {
+		if text == "" {
+			return
+		}
+		parsed := ParseDocs([]byte(text))
+		diags = diags.Extend(interpretPulumiRefs(path, types, parsed, resolver))
+	}
+
+	checkProperties := func(basePath string, props map[string]PropertySpec) {
+		for _, name := range sortedKeys(props) {
+			prop := props[name]
+			propPath := basePath + "/" + url.PathEscape(name)
+			check(propPath+"/description", prop.Description)
+			check(propPath+"/deprecationMessage", prop.DeprecationMessage)
+		}
+	}
+
+	checkResourceSpec := func(basePath string, res ResourceSpec) {
+		check(basePath+"/description", res.Description)
+		check(basePath+"/deprecationMessage", res.DeprecationMessage)
+		checkProperties(basePath+"/inputProperties", res.InputProperties)
+		checkProperties(basePath+"/properties", res.Properties)
+		if res.StateInputs != nil {
+			siPath := basePath + "/stateInputs"
+			check(siPath+"/description", res.StateInputs.Description)
+			checkProperties(siPath+"/properties", res.StateInputs.Properties)
+		}
+	}
+
+	// Package description
+	check("#/description", spec.Description)
+
+	// Config variables
+	for _, name := range sortedKeys(spec.Config.Variables) {
+		v := spec.Config.Variables[name]
+		vPath := memberPath("config/variables", name)
+		check(vPath+"/description", v.Description)
+		check(vPath+"/deprecationMessage", v.DeprecationMessage)
+	}
+
+	// Functions
+	for _, token := range sortedKeys(spec.Functions) {
+		f := spec.Functions[token]
+		fPath := memberPath("functions", token)
+		check(fPath+"/description", f.Description)
+		check(fPath+"/deprecationMessage", f.DeprecationMessage)
+		if f.Inputs != nil {
+			check(fPath+"/inputs/description", f.Inputs.Description)
+			checkProperties(fPath+"/inputs/properties", f.Inputs.Properties)
+		}
+		if f.Outputs != nil {
+			check(fPath+"/outputs/description", f.Outputs.Description)
+			checkProperties(fPath+"/outputs/properties", f.Outputs.Properties)
+		}
+	}
+
+	// Provider
+	if spec.Provider != nil {
+		checkResourceSpec("#/provider", *spec.Provider)
+	}
+
+	// Resources
+	for _, token := range sortedKeys(spec.Resources) {
+		checkResourceSpec(memberPath("resources", token), spec.Resources[token])
+	}
+
+	// Types
+	for _, token := range sortedKeys(spec.Types) {
+		t := spec.Types[token]
+		tPath := memberPath("types", token)
+		check(tPath+"/description", t.Description)
+		for i, e := range t.Enum {
+			ePath := fmt.Sprintf("%s/enum/%d", tPath, i)
+			check(ePath+"/description", e.Description)
+			check(ePath+"/deprecationMessage", e.DeprecationMessage)
+		}
+		checkProperties(tPath+"/properties", t.Properties)
+	}
+
+	return diags
 }
 
 // compareTypes is a total order on Type values used to sort the package's
@@ -1931,12 +2102,50 @@ func bindParameterization(spec *ParameterizationSpec) (*Parameterization, hcl.Di
 	}
 
 	return &Parameterization{
-		BaseProvider: BaseProvider{
+		BasePlugin: BasePlugin{
 			Name:    spec.BaseProvider.Name,
 			Version: ver,
 		},
 		Parameter: spec.Parameter,
 	}, nil
+}
+
+// bindExtensionParameterization binds an extension parameterization spec to the
+// ExtensionParameterization type.
+func bindExtensionParameterization(spec *ExtensionParameterizationSpec) (*ExtensionParameterization, hcl.Diagnostics) {
+	if spec == nil {
+		return nil, nil
+	}
+	if spec.BaseProvider.Name == "" {
+		return nil, hcl.Diagnostics{errorf(
+			"#/extensionParameterization/baseProvider/name",
+			"provider name must be specified")}
+	}
+	ver, err := semver.Parse(spec.BaseProvider.Version)
+	if err != nil {
+		return nil, hcl.Diagnostics{errorf(
+			"#/extensionParameterization/baseProvider/version",
+			"invalid version %q: %v", spec.BaseProvider.Version, err)}
+	}
+	base := BaseProvider{Name: spec.BaseProvider.Name, Version: ver}
+	if p := spec.BaseProvider.Parameterization; p != nil {
+		if p.BasePlugin.Name == "" {
+			return nil, hcl.Diagnostics{errorf(
+				"#/extensionParameterization/baseProvider/parameterization/basePlugin/name",
+				"provider name must be specified")}
+		}
+		pver, err := semver.Parse(p.BasePlugin.Version)
+		if err != nil {
+			return nil, hcl.Diagnostics{errorf(
+				"#/extensionParameterization/baseProvider/parameterization/basePlugin/version",
+				"invalid version %q: %v", p.BasePlugin.Version, err)}
+		}
+		base.Parameterization = &Parameterization{
+			BasePlugin: BasePlugin{Name: p.BasePlugin.Name, Version: pver},
+			Parameter:  p.Parameter,
+		}
+	}
+	return &ExtensionParameterization{BaseProvider: base, Parameter: spec.Parameter}, nil
 }
 
 func bindConfig(spec ConfigSpec, types *types, options ValidationOptions) ([]*Property, hcl.Diagnostics, error) {
@@ -1968,6 +2177,9 @@ func (t *types) bindResourceDef(
 		t.resourceDefs[token] = res
 
 		path := memberPath("resources", token)
+		if diag := validatePrintableName(path, "resource name", token); diag != nil {
+			diags = diags.Append(diag)
+		}
 		parts := strings.Split(token, ":")
 		if len(parts) == 3 {
 			name := parts[2]
@@ -2124,11 +2336,16 @@ func (t *types) bindProvider(decl *Resource, options ValidationOptions) (hcl.Dia
 	stringProperties := slice.Prealloc[*Property](len(decl.Properties))
 	for _, prop := range decl.Properties {
 		typ := plainType(prop.Type)
-		if tokenType, isTokenType := typ.(*TokenType); isTokenType {
-			if tokenType.UnderlyingType != stringType {
+		switch typ := typ.(type) {
+		case *TokenType:
+			if typ.UnderlyingType != stringType {
 				continue
 			}
-		} else {
+		case *EnumType:
+			if typ.ElementType != stringType {
+				continue
+			}
+		default:
 			if typ != stringType {
 				continue
 			}
@@ -2147,10 +2364,18 @@ func (t *types) finishResources(
 ) (*Resource, []*Resource, hcl.Diagnostics, error) {
 	var diags hcl.Diagnostics
 
-	provider, provDiags, err := t.bindResourceTypeDef("pulumi:providers:"+t.pkg.Name, options)
-	diags = diags.Extend(provDiags)
-	if err != nil {
-		return nil, nil, diags, fmt.Errorf("error binding provider: %w", err)
+	// Bind the package's provider, if it has one. Extension parameterizations have
+	// none, so GetResourceSpec reports it absent.
+	var provider *ResourceType
+	if _, ok, err := t.spec.GetResourceSpec("pulumi:providers:" + t.pkg.Name); err != nil {
+		return nil, nil, diags, err
+	} else if ok {
+		bound, provDiags, err := t.bindResourceTypeDef("pulumi:providers:"+t.pkg.Name, options)
+		diags = diags.Extend(provDiags)
+		if err != nil {
+			return nil, nil, diags, fmt.Errorf("error binding provider: %w", err)
+		}
+		provider = bound
 	}
 
 	resources := slice.Prealloc[*Resource](len(tokens))
@@ -2167,7 +2392,11 @@ func (t *types) finishResources(
 		return resources[i].Token < resources[j].Token
 	})
 
-	return provider.Resource, resources, diags, nil
+	var providerResource *Resource
+	if provider != nil {
+		providerResource = provider.Resource
+	}
+	return providerResource, resources, diags, nil
 }
 
 func (t *types) bindFunctionDef(token string, options ValidationOptions) (*Function, hcl.Diagnostics, error) {
@@ -2183,6 +2412,9 @@ func (t *types) bindFunctionDef(token string, options ValidationOptions) (*Funct
 	var diags hcl.Diagnostics
 
 	path := memberPath("functions", token)
+	if diag := validatePrintableName(path, "function name", token); diag != nil {
+		diags = diags.Append(diag)
+	}
 	parts := strings.Split(token, ":")
 	if len(parts) == 3 {
 		name := parts[2]

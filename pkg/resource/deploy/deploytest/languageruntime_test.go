@@ -17,7 +17,7 @@ package deploytest
 import (
 	"testing"
 
-	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
+	"github.com/pulumi/pulumi/pkg/v3/resource/plugin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -44,7 +44,7 @@ func TestLanguageRuntime(t *testing.T) {
 		t.Run("GetRequiredPackages", func(t *testing.T) {
 			t.Parallel()
 			p := &languageRuntime{closed: true}
-			_, err := p.GetRequiredPackages(t.Context(), plugin.ProgramInfo{})
+			_, _, err := p.GetRequiredPackages(t.Context(), plugin.ProgramInfo{})
 			assert.ErrorIs(t, err, ErrLanguageRuntimeIsClosed)
 		})
 		t.Run("GetPluginInfo", func(t *testing.T) {

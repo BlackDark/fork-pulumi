@@ -52,14 +52,12 @@ func panicHandler(finished *bool) {
 		fmt.Fprintf(os.Stderr, "Operating System: %s\n", runtime.GOOS)
 		fmt.Fprintf(os.Stderr, "Panic:            %s\n\n", panicPayload)
 		fmt.Fprintln(os.Stderr, stack)
-		os.Exit(1)
+		os.Exit(1) //nolint:noosexit // panicHandler is the last-resort crash reporter; it must terminate.
 	}
 }
 
 func main() {
-	// Fix for https://github.com/pulumi/pulumi/issues/18814, set GOMAXPROCs to the number of CPUs available
-	// taking into account quotas and cgroup limits.
-	maxprocs.Set() //nolint:errcheck // we don't care if this fails
+	maxprocs.Set() //nolint:errcheck
 
 	finished := new(bool)
 	defer panicHandler(finished)

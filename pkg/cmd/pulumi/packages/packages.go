@@ -27,18 +27,22 @@ import (
 	"strings"
 
 	"github.com/hashicorp/hcl/v2"
+	segmentiojson "github.com/segmentio/encoding/json"
+
 	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/packageinstallation"
 	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/packageresolution"
 	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/packageworkspace"
+	"github.com/pulumi/pulumi/pkg/v3/codegen/convert"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/schema"
+	pkghost "github.com/pulumi/pulumi/pkg/v3/host"
 	"github.com/pulumi/pulumi/pkg/v3/pluginstorage"
+	"github.com/pulumi/pulumi/pkg/v3/registry"
+	"github.com/pulumi/pulumi/pkg/v3/resource/plugin"
 	pkgCmdUtil "github.com/pulumi/pulumi/pkg/v3/util/cmdutil"
 	pkgWorkspace "github.com/pulumi/pulumi/pkg/v3/workspace"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/env"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/registry"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/cmdutil"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/errutil"
@@ -51,8 +55,15 @@ import (
 )
 
 // BindSpec binds a PackageSpec into a Package, returning any error or error diagnostics encountered.
-func BindSpec(spec schema.PackageSpec) (*schema.Package, error) {
-	pkg, diags, err := schema.BindSpec(spec, nil, schema.ValidationOptions{
+func BindSpec(spec schema.PackageSpec, loader schema.Loader) (*schema.Package, error) {
+	return BindSpecWithContext(context.Background(), spec, loader)
+}
+
+// BindSpecWithContext is [BindSpec] with an explicit context that parents the spans emitted while binding.
+func BindSpecWithContext(
+	ctx context.Context, spec schema.PackageSpec, loader schema.Loader,
+) (*schema.Package, error) {
+	pkg, diags, err := schema.BindSpecWithContext(ctx, spec, loader, schema.ValidationOptions{
 		AllowDanglingReferences: true,
 	})
 	if err != nil {
@@ -79,7 +90,7 @@ func InstallPackage(stdout io.Writer, ws pkgWorkspace.Context, proj workspace.Ba
 		return nil, nil, nil, fmt.Errorf("failed to get schema: %w", err)
 	}
 
-	pkg, err := BindSpec(*pkgSpec)
+	pkg, err := BindSpec(*pkgSpec, schema.NewPluginLoader(pctx))
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to bind schema: %w", err)
 	}
@@ -99,6 +110,7 @@ func InstallPackage(stdout io.Writer, ws pkgWorkspace.Context, proj workspace.Ba
 
 	diags, err := GenSDK(
 		pctx.Request(),
+		registry,
 		language,
 		tempOut,
 		pkg,
@@ -152,7 +164,7 @@ func InstallPackage(stdout io.Writer, ws pkgWorkspace.Context, proj workspace.Ba
 }
 
 func GenSDK(
-	ctx context.Context, language, out string, pkg *schema.Package, overlays string, local bool,
+	ctx context.Context, reg registry.Registry, language, out string, pkg *schema.Package, overlays string, local bool,
 ) (hcl.Diagnostics, error) {
 	tracer := otel.Tracer("pulumi-cli")
 	_, span := cmdutil.StartSpan(ctx, tracer, "generate-sdk",
@@ -183,17 +195,18 @@ func GenSDK(
 			return nil, err
 		}
 
-		pCtx, err := NewPluginContext(cwd)
+		pCtx, err := NewPluginContext(cwd, reg)
 		if err != nil {
 			return nil, fmt.Errorf("create plugin context: %w", err)
 		}
+		defer contract.IgnoreClose(pCtx.Host)
 		defer contract.IgnoreClose(pCtx)
-		languagePlugin, err := pCtx.Host.LanguageRuntime(language)
+		languagePlugin, err := pCtx.Host.LanguageRuntime(pCtx, language)
 		if err != nil {
 			return nil, err
 		}
 
-		loader := schema.NewPluginLoader(pCtx.Host)
+		loader := schema.NewPluginLoader(pCtx)
 		loaderServer := schema.NewLoaderServer(loader)
 		grpcServer, err := plugin.NewServer(pCtx, schema.LoaderRegistration(loaderServer))
 		if err != nil {
@@ -270,7 +283,10 @@ func LinkPackages(ctx *LinkPackagesContext) error {
 	if err != nil {
 		return err
 	}
-	languagePlugin, err := ctx.PluginContext.Host.LanguageRuntime(ctx.Project.RuntimeInfo().Name())
+	if ctx.Project.RuntimeInfo().Name() == "" {
+		return errors.New("cannot link packages into a project without a runtime")
+	}
+	languagePlugin, err := ctx.PluginContext.Host.LanguageRuntime(ctx.PluginContext, ctx.Project.RuntimeInfo().Name())
 	if err != nil {
 		return err
 	}
@@ -281,7 +297,7 @@ func LinkPackages(ctx *LinkPackagesContext) error {
 	for _, pkg := range ctx.Packages {
 		entries[pkg.Pkg.Identity()] = pkg.Pkg.Reference()
 	}
-	loader := schema.NewCachedLoaderWithEntries(schema.NewPluginLoader(ctx.PluginContext.Host), entries)
+	loader := schema.NewCachedLoaderWithEntries(schema.NewPluginLoader(ctx.PluginContext), entries)
 	loaderServer := schema.NewLoaderServer(loader)
 	grpcServer, err := plugin.NewServer(ctx.PluginContext, schema.LoaderRegistration(loaderServer))
 	if err != nil {
@@ -327,16 +343,21 @@ func LinkPackages(ctx *LinkPackagesContext) error {
 	return nil
 }
 
-func NewPluginContext(cwd string) (*plugin.Context, error) {
+func NewPluginContext(cwd string, reg registry.Registry) (*plugin.Context, error) {
 	// Helper used by callers without a *cobra.Command writer; emits to
 	// process stderr.
 	sink := diag.DefaultSink(os.Stderr, os.Stderr, diag.FormatOptions{ //nolint:forbidigo
 		Color: cmdutil.GetGlobalColorization(),
 	})
-	pluginCtx, err := plugin.NewContext(context.TODO(), sink, sink, nil, nil, cwd, nil, true, nil,
-		schema.NewLoaderServerFromHost)
+	pluginHost, err := pkghost.New(context.TODO(), sink, sink, nil,
+		pkgWorkspace.EnsureLanguageInstalled, schema.NewLoaderServerFromContext, convert.NewMapperServerFromContext,
+		packageworkspace.NewResolverServer(reg))
 	if err != nil {
 		return nil, err
+	}
+	pluginCtx, err := plugin.NewContext(context.TODO(), sink, sink, pluginHost, nil, cwd, nil, true, nil)
+	if err != nil {
+		return nil, errors.Join(err, pluginHost.Close())
 	}
 	return pluginCtx, nil
 }
@@ -364,68 +385,17 @@ func SchemaFromSchemaSource(
 	pctx *plugin.Context, packageSource string, parameters plugin.ParameterizeParameters, registry registry.Registry,
 	env env.Env, concurrency int,
 ) (*schema.PackageSpec, *workspace.PackageSpec, error) {
+	raw, packageSpec, err := schemaJSONBytes(ws, pctx, packageSource, parameters, registry, env, concurrency)
+	if err != nil {
+		return nil, nil, err
+	}
 	var spec schema.PackageSpec
-	if ext := filepath.Ext(packageSource); ext == ".yaml" || ext == ".yml" {
-		if !parameters.Empty() {
-			return nil, nil, errors.New("parameterization arguments are not supported for yaml files")
-		}
-		f, err := os.ReadFile(packageSource)
-		if err != nil {
-			return nil, nil, err
-		}
-		err = yaml.Unmarshal(f, &spec)
-		if err != nil {
-			return nil, nil, err
-		}
+	if err := json.Unmarshal(raw, &spec); err != nil {
+		return nil, nil, err
+	}
+	if packageSpec == nil {
+		// The schema came from a file, so there is no plugin to describe.
 		return &spec, nil, nil
-	} else if ext == ".json" {
-		if !parameters.Empty() {
-			return nil, nil, errors.New("parameterization arguments are not supported for json files")
-		}
-
-		f, err := os.ReadFile(packageSource)
-		if err != nil {
-			return nil, nil, err
-		}
-		err = json.Unmarshal(f, &spec)
-		if err != nil {
-			return nil, nil, err
-		}
-		return &spec, nil, nil
-	}
-
-	p, packageSpec, err := ProviderFromSource(ws, pctx, packageSource, registry, env, concurrency)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer contract.IgnoreClose(p)
-
-	var request plugin.GetSchemaRequest
-	if !parameters.Empty() {
-		resp, err := p.Parameterize(pctx.Request(), plugin.ParameterizeRequest{
-			Parameters: parameters,
-		})
-		if err != nil {
-			return nil, nil, fmt.Errorf("parameterize: %w", err)
-		}
-
-		request = plugin.GetSchemaRequest{
-			SubpackageName:    resp.Name,
-			SubpackageVersion: &resp.Version,
-		}
-	}
-
-	tracer := otel.Tracer("pulumi-cli")
-	_, schemaSpan := cmdutil.StartSpan(pctx.Request(), tracer, "get-schema",
-		trace.WithAttributes(attribute.String("source", packageSource)))
-	schema, err := p.GetSchema(pctx.Request(), request)
-	schemaSpan.End()
-	if err != nil {
-		return nil, nil, err
-	}
-	err = json.Unmarshal(schema.Schema, &spec)
-	if err != nil {
-		return nil, nil, err
 	}
 	pluginSpec, err := workspace.NewPluginDescriptor(pctx.Request(), packageSource, apitype.ResourcePlugin, nil, "", nil)
 	if err != nil {
@@ -435,7 +405,82 @@ func SchemaFromSchemaSource(
 		spec.PluginDownloadURL = pluginSpec.PluginDownloadURL
 	}
 	setSpecNamespace(&spec, pluginSpec)
-	return &spec, &packageSpec, nil
+	return &spec, packageSpec, nil
+}
+
+// PartialPackageFromSchemaSource loads a schema source into a lazily-bound *schema.PartialPackage.
+// Unlike SchemaFromSchemaSource it does not parse or bind the whole schema up front, so commands
+// that only need a few members (e.g. `pulumi package info --resource`) avoid the cost of binding
+// the entire package.
+func PartialPackageFromSchemaSource(
+	ctx context.Context,
+	ws pkgWorkspace.Context, pctx *plugin.Context, packageSource string,
+	parameters plugin.ParameterizeParameters, reg registry.Registry, env env.Env, concurrency int,
+) (*schema.PartialPackage, error) {
+	raw, _, err := schemaJSONBytes(ws, pctx, packageSource, parameters, reg, env, concurrency)
+	if err != nil {
+		return nil, err
+	}
+	var spec schema.PartialPackageSpec
+	if _, err := segmentiojson.Parse(raw, &spec, segmentiojson.ZeroCopy); err != nil {
+		return nil, fmt.Errorf("unmarshal schema: %w", err)
+	}
+	return schema.ImportPartialSpecWithContext(ctx, spec, nil, schema.NewPluginLoader(pctx))
+}
+
+// schemaJSONBytes returns the raw JSON bytes of a schema source (a YAML or JSON file, or a
+// provider's schema). The returned workspace.PackageSpec is non-nil if and only if the schema is
+// sourced from a plugin.
+func schemaJSONBytes(
+	ws pkgWorkspace.Context, pctx *plugin.Context, packageSource string,
+	parameters plugin.ParameterizeParameters, reg registry.Registry, env env.Env, concurrency int,
+) ([]byte, *workspace.PackageSpec, error) {
+	switch filepath.Ext(packageSource) {
+	case ".yaml", ".yml":
+		if !parameters.Empty() {
+			return nil, nil, errors.New("parameterization arguments are not supported for yaml files")
+		}
+		f, err := os.ReadFile(packageSource)
+		if err != nil {
+			return nil, nil, err
+		}
+		var spec schema.PackageSpec
+		if err := yaml.Unmarshal(f, &spec); err != nil {
+			return nil, nil, err
+		}
+		raw, err := json.Marshal(spec)
+		return raw, nil, err
+	case ".json":
+		if !parameters.Empty() {
+			return nil, nil, errors.New("parameterization arguments are not supported for json files")
+		}
+		raw, err := os.ReadFile(packageSource)
+		return raw, nil, err
+	}
+
+	p, packageSpec, err := ProviderFromSource(ws, pctx, packageSource, reg, env, concurrency)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer contract.IgnoreClose(p)
+
+	var request plugin.GetSchemaRequest
+	if !parameters.Empty() {
+		resp, err := p.Parameterize(pctx.Request(), plugin.ParameterizeRequest{Parameters: parameters})
+		if err != nil {
+			return nil, nil, fmt.Errorf("parameterize: %w", err)
+		}
+		request = plugin.GetSchemaRequest{SubpackageName: resp.Name, SubpackageVersion: &resp.Version}
+	}
+	tracer := otel.Tracer("pulumi-cli")
+	_, schemaSpan := cmdutil.StartSpan(pctx.Request(), tracer, "get-schema",
+		trace.WithAttributes(attribute.String("source", packageSource)))
+	getSchema, err := p.GetSchema(pctx.Request(), request)
+	schemaSpan.End()
+	if err != nil {
+		return nil, nil, err
+	}
+	return getSchema.Schema, &packageSpec, nil
 }
 
 // ProviderFromSource takes a plugin name or path.
@@ -446,6 +491,23 @@ func ProviderFromSource(
 	pctx *plugin.Context, packageSource string, reg registry.Registry,
 	e env.Env, concurrency int,
 ) (plugin.Provider, workspace.PackageSpec, error) {
+	// Helper without a *cobra.Command writer; plumbing the writer into
+	// packageworkspace.New would require a much larger API change.
+	installCtx := packageworkspace.New(pluginstorage.Instance, ws, pctx, os.Stderr, os.Stderr, //nolint:forbidigo
+		nil, packageworkspace.Options{})
+	return providerFromSource(pctx, packageSource, reg, e, concurrency, installCtx)
+}
+
+// providerFromSource is the injectable core of [ProviderFromSource]. It performs all package
+// resolution, installation, and launching through installCtx, allowing tests to substitute a
+// mock [packageinstallation.Context] for the real, IO-performing [packageworkspace.Workspace].
+func providerFromSource(
+	pctx *plugin.Context, packageSource string, reg registry.Registry,
+	e env.Env, concurrency int, installCtx packageinstallation.Context,
+) (plugin.Provider, workspace.PackageSpec, error) {
+	ctx, span := otel.Tracer("pulumi-cli").Start(pctx.Request(), "provider.load")
+	defer span.End()
+
 	var version string
 	if parts := strings.SplitN(packageSource, "@", 2); len(parts) > 1 {
 		packageSource = parts[0]
@@ -453,7 +515,7 @@ func ProviderFromSource(
 	}
 	packageSpec := workspace.PackageSpec{Source: packageSource, Version: version}
 	{
-		proj, _, err := ws.LoadBaseProjectFrom(pctx.Request(), pctx.Pwd)
+		proj, _, err := installCtx.LoadBaseProjectFrom(ctx, pctx.Pwd)
 		if err != nil && !errors.Is(err, workspace.ErrProjectNotFound) {
 			return nil, workspace.PackageSpec{}, fmt.Errorf("error loading Pulumi Project: %w", err)
 		}
@@ -464,21 +526,18 @@ func ProviderFromSource(
 		}
 	}
 
-	// Helper without a *cobra.Command writer; plumbing the writer into
-	// packageworkspace.New would require a much larger API change.
-	f, spec, err := packageinstallation.InstallPlugin(pctx.Request(), packageSpec, nil, "", packageinstallation.Options{
+	f, spec, _, err := packageinstallation.InstallPlugin(ctx, packageSpec, nil, "", packageinstallation.Options{
 		Options: packageresolution.Options{
 			ResolveWithRegistry:                        !e.GetBool(env.DisableRegistryResolve),
 			ResolveVersionWithLocalWorkspace:           true,
 			AllowNonInvertableLocalWorkspaceResolution: true,
 		},
 		Concurrency: concurrency,
-	}, reg, packageworkspace.New(pluginstorage.Instance, ws, pctx.Host, os.Stderr, os.Stderr, //nolint:forbidigo
-		nil, packageworkspace.Options{}))
+	}, reg, installCtx)
 	if err != nil {
 		return nil, workspace.PackageSpec{}, fmt.Errorf("unable to install %s: %w", packageSpec, err)
 	}
-	p, err := f(pctx.Request(), ".")
+	p, err := f(ctx, ".")
 	if err != nil {
 		return nil, workspace.PackageSpec{}, fmt.Errorf("unable to run %s: %w", packageSpec, err)
 	}

@@ -25,32 +25,38 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 
+	pkgresource "github.com/pulumi/pulumi/pkg/v3/resource"
+
 	"github.com/blang/semver"
 	"github.com/hashicorp/hcl/v2"
 	"github.com/pulumi/pulumi/pkg/v3/backend"
 	backendDisplay "github.com/pulumi/pulumi/pkg/v3/backend/display"
 	"github.com/pulumi/pulumi/pkg/v3/backend/diy"
+	"github.com/pulumi/pulumi/pkg/v3/codegen/convert"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/pcl"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/schema"
 	"github.com/pulumi/pulumi/pkg/v3/engine"
+	pkghost "github.com/pulumi/pulumi/pkg/v3/host"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
+	"github.com/pulumi/pulumi/pkg/v3/resource/plugin"
 	"github.com/pulumi/pulumi/pkg/v3/resource/stack"
 	"github.com/pulumi/pulumi/pkg/v3/secrets"
 	b64secrets "github.com/pulumi/pulumi/pkg/v3/secrets/b64"
 	"github.com/pulumi/pulumi/pkg/v3/testing/pulumi-test-language/tests"
+	pkgWorkspace "github.com/pulumi/pulumi/pkg/v3/workspace"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag/colors"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/env"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/promise"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/rpcutil"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
@@ -90,6 +96,7 @@ func NewLanguageTestServer(testdata fs.FS, languageTests map[string]tests.Langua
 		artifactMap:    gsync.Map[string, string]{},
 		testdata:       testdata,
 		languageTests:  languageTests,
+		runSlots:       make(chan struct{}, runtime.NumCPU()),
 	}
 }
 
@@ -189,6 +196,7 @@ func Start(
 		cliVersion:     "3.200.0",
 		testdata:       testdata,
 		languageTests:  languageTests,
+		runSlots:       make(chan struct{}, runtime.NumCPU()),
 	}
 
 	// Fire up a gRPC server and start listening for incomings.
@@ -224,6 +232,13 @@ type languageTestServer struct {
 
 	providersLock  gsync.Map[string, *sync.Mutex]
 	providersCache map[string]bool
+
+	// Bounds concurrent RunLanguageTest executions to the hardware. Test
+	// suites run with more parallel subtests than CI runners have cores; that
+	// used to be throttled incidentally by every project's dependency install,
+	// but with the install cache the compile-and-run phases of all parallel
+	// tests align and their combined memory demand can take down the runner.
+	runSlots chan struct{}
 
 	// A map storing the paths to the generated package artifacts
 	artifactMap gsync.Map[string, string]
@@ -326,6 +341,7 @@ func (eng *languageTestServer) RequirePulumiVersion(ctx context.Context, req *pu
 type providerLoader struct {
 	language, languageInfo string
 
+	pctx *plugin.Context
 	host plugin.Host
 }
 
@@ -351,7 +367,7 @@ func (l *providerLoader) LoadPackageReferenceV2(
 		PluginDownloadURL: descriptor.DownloadURL,
 	}
 
-	provider, err := l.host.Provider(workspaceDescriptor, env.Global())
+	provider, err := l.host.Provider(l.pctx, workspaceDescriptor, env.Global())
 	if err != nil {
 		return nil, fmt.Errorf("could not load schema for %s: %w", descriptor.Name, err)
 	}
@@ -403,7 +419,7 @@ func (l *providerLoader) LoadPackageReferenceV2(
 		}
 	}
 
-	p, err := schema.ImportPartialSpec(spec, nil, l)
+	p, err := schema.ImportPartialSpecWithContext(ctx, spec, nil, l)
 	if err != nil {
 		return nil, err
 	}
@@ -532,9 +548,14 @@ func (eng *languageTestServer) PrepareLanguageTests(
 		Color: colors.Never,
 	})
 
-	// Start up a plugin context
-	pctx, err := plugin.NewContextWithRoot(ctx, snk, snk, nil, "", "", nil, false, nil, nil, nil, nil,
-		nil, schema.NewLoaderServerFromHost)
+	// Start up a plugin host and context. The host is owned here and closed after the context.
+	pluginHost, err := pkghost.New(context.WithoutCancel(ctx), snk, snk, nil, pkgWorkspace.EnsureLanguageInstalled,
+		schema.NewLoaderServerFromContext, convert.NewMapperServerFromContext, nil)
+	if err != nil {
+		return nil, fmt.Errorf("setup plugin host: %w", err)
+	}
+	defer contract.IgnoreClose(pluginHost)
+	pctx, err := plugin.NewContextWithRoot(ctx, snk, snk, pluginHost, "", "", nil, false, nil, nil, nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("setup plugin context: %w", err)
 	}
@@ -635,16 +656,30 @@ func (eng *languageTestServer) PrepareLanguageTests(
 	}, nil
 }
 
-func GetProviderVersion(provider plugin.Provider) (semver.Version, error) {
-	pkg := provider.Pkg()
-	info, err := provider.GetPluginInfo(context.TODO())
+func GetProviderVersion(ctx context.Context, provider plugin.Provider) (semver.Version, error) {
+	info, err := provider.GetPluginInfo(ctx)
 	if err != nil {
-		return semver.Version{}, fmt.Errorf("get plugin info for %s: %w", pkg, err)
+		return semver.Version{}, fmt.Errorf("get plugin info: %w", err)
 	}
 	if info.Version == nil {
-		return semver.Version{}, fmt.Errorf("provider %s has no version", pkg)
+		return semver.Version{}, errors.New("provider has no version")
 	}
 	return *info.Version, nil
+}
+
+func GetProviderName(ctx context.Context, provider plugin.Provider) (string, error) {
+	resp, err := provider.GetSchema(ctx, plugin.GetSchemaRequest{})
+	if err != nil {
+		return "", err
+	}
+	var s schema.PartialPackageSpec
+	if err := json.Unmarshal(resp.Schema, &s); err != nil {
+		return "", fmt.Errorf("unable to unmarshal schema for name: %w", err)
+	}
+	if s.Name == "" {
+		return "", errors.New("invalid schema: empty name")
+	}
+	return s.Name, nil
 }
 
 func hasDependency(pkg *schema.Package, dep string) bool {
@@ -662,6 +697,9 @@ func hasDependency(pkg *schema.Package, dep string) bool {
 func (eng *languageTestServer) RunLanguageTest(
 	ctx context.Context, req *testingrpc.RunLanguageTestRequest,
 ) (*testingrpc.RunLanguageTestResponse, error) {
+	eng.runSlots <- struct{}{}
+	defer func() { <-eng.runSlots }()
+
 	test, has := eng.languageTests[req.Test]
 	if !has {
 		return nil, fmt.Errorf("unknown test %s", req.Test)
@@ -703,18 +741,6 @@ func (eng *languageTestServer) RunLanguageTest(
 		Color: colors.Never,
 	})
 
-	// Start up a plugin context
-	pctx, err := plugin.NewContextWithRoot(
-		ctx, snk, snk, nil, token.TemporaryDirectory, token.TemporaryDirectory, nil, false, nil, nil, nil, nil,
-		nil, schema.NewLoaderServerFromHost)
-	if err != nil {
-		return nil, fmt.Errorf("setup plugin context: %w", err)
-	}
-	defer contract.IgnoreClose(pctx)
-
-	// NewContextWithRoot will make a default plugin host, but we want to make sure we never actually use that
-	pctx.Host = nil
-
 	// Connect to the language host
 	conn, err := grpc.NewClient(token.LanguagePluginTarget, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -724,45 +750,39 @@ func (eng *languageTestServer) RunLanguageTest(
 	languageClient := plugin.NewLanguageRuntimeClient(
 		token.LanguagePluginName, pulumirpc.NewLanguageRuntimeClient(conn))
 
-	// And now replace the context host with our own test host
 	host := &testHost{
-		engine:      eng,
-		ctx:         pctx,
-		host:        pctx.Host,
-		runtime:     languageClient,
-		runtimeName: token.LanguagePluginName,
-		providers:   make(map[string]func() (plugin.Provider, error)),
-		connections: make(map[plugin.Provider]io.Closer),
+		engine:          eng,
+		runtime:         languageClient,
+		runtimeName:     token.LanguagePluginName,
+		languageInfo:    token.LanguageInfo,
+		providers:       make(map[string]func() (plugin.Provider, error)),
+		connections:     make(map[plugin.Provider]io.Closer),
+		contextServices: make(map[*plugin.Context][]*plugin.GrpcServer),
 	}
 
-	pctx.Host = host
-
-	// Setup a schema loader for any package lookups, installs and code generation.
-	loader := &providerLoader{
-		language:     token.LanguagePluginName,
-		languageInfo: token.LanguageInfo,
-		host:         host,
-	}
-	loaderServer := schema.NewLoaderServer(loader)
-	grpcServer, err := plugin.NewServer(pctx, schema.LoaderRegistration(loaderServer))
+	pctx, err := plugin.NewContextWithRoot(
+		ctx, snk, snk, host, token.TemporaryDirectory, token.TemporaryDirectory, nil, false, nil, nil, nil, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("setup plugin context: %w", err)
 	}
-	defer contract.IgnoreClose(grpcServer)
-
-	host.loaderAddress = grpcServer.Addr()
+	defer contract.IgnoreClose(pctx)
+	contract.Assertf(pctx.LoaderAddr() != "" && host.loader != nil, "NewContextWithRoot must invoke the host's loader")
+	loader := host.loader
 
 	// And fill that host with our test providers
 	for _, provider := range test.Providers {
 		p := provider()
-		version, err := GetProviderVersion(p)
+		version, err := GetProviderVersion(ctx, p)
 		if err != nil {
 			return nil, err
 		}
-		key := fmt.Sprintf("%s@%s", p.Pkg(), version)
+		pkg, err := GetProviderName(ctx, p)
+		if err != nil {
+			return nil, err
+		}
+		key := fmt.Sprintf("%s@%s", pkg, version)
 
 		// If this is a provider that should be overridden using the languages plugin directory try and do that now.
-		pkg := p.Pkg().String()
 		if slices.Contains(test.LanguageProviders, pkg) {
 			cacheKey := fmt.Sprintf("%s@%s", key, token.TemporaryDirectory)
 			// The second return value indicates whether the result was loaded or stored
@@ -774,7 +794,7 @@ func (eng *languageTestServer) RunLanguageTest(
 			targetDirectory := filepath.Join(token.TemporaryDirectory, "providers", pkg)
 			if eng.providersCache[cacheKey] {
 				host.providers[key] = func() (plugin.Provider, error) {
-					pluginProvider, err := plugin.NewProviderFromPath(host, pctx, p.Pkg(), targetDirectory)
+					pluginProvider, err := plugin.NewProviderFromPath(host, pctx, targetDirectory)
 					if err != nil {
 						return nil, fmt.Errorf("load provider %s from %s: %w", pkg, targetDirectory, err)
 					}
@@ -805,7 +825,7 @@ func (eng *languageTestServer) RunLanguageTest(
 						},
 					},
 				}}
-				_, err = languageClient.Link(ctx, providerInfo, linkDeps, grpcServer.Addr())
+				_, err = languageClient.Link(ctx, providerInfo, linkDeps, pctx.LoaderAddr())
 				if err != nil {
 					return makeTestResponse(fmt.Sprintf("link program: %v", err)), nil
 				}
@@ -816,7 +836,7 @@ func (eng *languageTestServer) RunLanguageTest(
 				}
 
 				host.providers[key] = func() (plugin.Provider, error) {
-					pluginProvider, err := plugin.NewProviderFromPath(host, pctx, p.Pkg(), targetDirectory)
+					pluginProvider, err := plugin.NewProviderFromPath(host, pctx, targetDirectory)
 					if err != nil {
 						return nil, fmt.Errorf("load provider %s from %s: %w", pkg, targetDirectory, err)
 					}
@@ -952,7 +972,7 @@ func (eng *languageTestServer) RunLanguageTest(
 				}
 
 				diags, err := languageClient.GeneratePackage(ctx,
-					sdkTempDir, string(schemaBytes), nil, grpcServer.Addr(), localDependencies, false)
+					sdkTempDir, string(schemaBytes), nil, pctx.LoaderAddr(), localDependencies, false)
 				if err != nil {
 					return makeTestResponse(fmt.Sprintf("generate package %s: %v", pkg.Name, err)), nil
 				}
@@ -1043,7 +1063,7 @@ func (eng *languageTestServer) RunLanguageTest(
 	}
 
 	languageTestResult, err := runLanguageTests(ctx, token, req.Test, test, loader, packages,
-		sdks, localDependencies, languageClient, grpcServer,
+		sdks, localDependencies, languageClient,
 		eng.DisableSnapshotWriting, snapshotEdits, testBackend, stdout, stderr, pctx, "projects", eng.testdata)
 	if err != nil || !languageTestResult.Success || token.ConverterPluginTarget == "" || req.SkipConvertTests {
 		return languageTestResult, err
@@ -1089,7 +1109,7 @@ func (eng *languageTestServer) RunLanguageTest(
 	}
 
 	return runLanguageTests(ctx, ejectToken, req.Test, test, loader, packages,
-		sdks, localDependencies, ejectTestingClient, grpcServer,
+		sdks, localDependencies, ejectTestingClient,
 		eng.DisableSnapshotWriting, snapshotEdits, ejectTestBackend, stdout, stderr, pctx,
 		"round-tripped-project", eng.testdata)
 }
@@ -1117,7 +1137,7 @@ func createStackReferences(
 
 		snap := &deploy.Snapshot{
 			SecretsManager: sm,
-			Resources: []*resource.State{
+			Resources: []*pkgresource.State{
 				{
 					Type: resource.RootStackType,
 					URN: resource.CreateURN(resourceName, string(resource.RootStackType), "",
@@ -1142,7 +1162,7 @@ func createStackReferences(
 func runLanguageTests(
 	ctx context.Context, token testToken, testName string, test tests.LanguageTest,
 	loader schema.ReferenceLoader, packages []*schema.Package, sdks, localDependencies map[string]string,
-	languageClient plugin.LanguageRuntime, grpcServer *plugin.GrpcServer,
+	languageClient plugin.LanguageRuntime,
 	disableSnapshotWriting bool, snapshotEdits []compiledReplacement,
 	testBackend diy.Backend,
 	stdout, stderr *bytes.Buffer,
@@ -1225,7 +1245,7 @@ func runLanguageTests(
 					}
 
 					diags, err := languageClient.GeneratePackage(ctx,
-						sdkTargetDir, string(schemaBytes), nil, grpcServer.Addr(), localDependencies, false)
+						sdkTargetDir, string(schemaBytes), nil, pctx.LoaderAddr(), localDependencies, false)
 					if err != nil {
 						return makeTestResponse(fmt.Sprintf("generate package %s: %v", pkg.Name, err)), nil
 					}
@@ -1247,7 +1267,7 @@ func runLanguageTests(
 			} else {
 				diagnostics, err = languageClient.GenerateProject(
 					ctx,
-					sourceDir, projectDir, projectJSON, true, grpcServer.Addr(), localDependencies)
+					sourceDir, projectDir, projectJSON, true, pctx.LoaderAddr(), localDependencies)
 				if err != nil {
 					return makeTestResponse(fmt.Sprintf("generate project: %v", err)), nil
 				}
@@ -1394,7 +1414,7 @@ func runLanguageTests(
 		// plugins inline, the runner checks GetRequiredPackages directly here. Tests opt out of the check with
 		// SkipEnsurePluginsValidation when the program intentionally diverges (e.g. version-pinning tests).
 		if !test.SkipEnsurePluginsValidation {
-			packages, err := languageClient.GetRequiredPackages(ctx, programInfo)
+			packages, _, err := languageClient.GetRequiredPackages(ctx, programInfo)
 			if err != nil {
 				return makeTestResponse(fmt.Sprintf("get required packages: %v", err)), nil
 			}
@@ -1410,8 +1430,30 @@ func runLanguageTests(
 					return makeTestResponse(fmt.Sprintf("get package definition: %v", err)), nil
 				}
 
+				// Replacement and extension parameterization keep their base plugin
+				// in different slots, but both resolve to the same base-plugin +
+				// parameterization descriptor a program depends on.
+				var baseName string
+				var baseVersion semver.Version
+				var parameter []byte
+				var parameterized bool
+				var isExtension bool
+				switch {
+				case pkgDef.Parameterization != nil:
+					baseName = pkgDef.Parameterization.BasePlugin.Name
+					baseVersion = pkgDef.Parameterization.BasePlugin.Version
+					parameter = pkgDef.Parameterization.Parameter
+					parameterized = true
+				case pkgDef.ExtensionParameterization != nil:
+					baseName = pkgDef.ExtensionParameterization.BaseProvider.Name
+					baseVersion = pkgDef.ExtensionParameterization.BaseProvider.Version
+					parameter = pkgDef.ExtensionParameterization.Parameter
+					parameterized = true
+					isExtension = true
+				}
+
 				var desc workspace.PackageDescriptor
-				if pkgDef.Parameterization == nil {
+				if !parameterized {
 					desc = workspace.PackageDescriptor{
 						PluginDescriptor: workspace.PluginDescriptor{
 							Name:    pkgDef.Name,
@@ -1421,14 +1463,22 @@ func runLanguageTests(
 				} else {
 					desc = workspace.PackageDescriptor{
 						PluginDescriptor: workspace.PluginDescriptor{
-							Name:    pkgDef.Parameterization.BaseProvider.Name,
-							Version: &pkgDef.Parameterization.BaseProvider.Version,
+							Name:    baseName,
+							Version: &baseVersion,
 						},
-						Parameterization: &workspace.Parameterization{
-							Name:    pkgDef.Name,
-							Version: *pkgDef.Version,
-							Value:   pkgDef.Parameterization.Parameter,
-						},
+					}
+					param := &workspace.Parameterization{
+						Name:    pkgDef.Name,
+						Version: *pkgDef.Version,
+						Value:   parameter,
+					}
+					// Replacement and extension parameterization live in different
+					// descriptor slots; the real language hosts report extensions via
+					// the extension slot, so the expectation must match.
+					if isExtension {
+						desc.ExtensionParameterization = param
+					} else {
+						desc.Parameterization = param
 					}
 				}
 
@@ -1455,12 +1505,22 @@ func runLanguageTests(
 					versionsMatch(&expected.Version, &actual.Version) &&
 					slices.Equal(expected.Value, actual.Value)
 			}
+			// Replacement and extension parameterization both carry base+name+value.
+			// SDK language hosts report an extension in the extension slot while the
+			// PCL host reports it in the parameterization slot, so compare whichever
+			// slot holds the parameterization.
+			effectiveParam := func(d workspace.PackageDescriptor) *workspace.Parameterization {
+				if d.ExtensionParameterization != nil {
+					return d.ExtensionParameterization
+				}
+				return d.Parameterization
+			}
 			for _, expectedPackage := range expectedPackages {
 				var found bool
 				for _, actual := range packages {
 					if actual.Name == expectedPackage.Name &&
 						versionsMatch(expectedPackage.Version, actual.Version) &&
-						parameterizationsMatch(expectedPackage.Parameterization, actual.Parameterization) {
+						parameterizationsMatch(effectiveParam(expectedPackage), effectiveParam(actual)) {
 						found = true
 						break
 					}
@@ -1476,7 +1536,7 @@ func runLanguageTests(
 				for _, expectedPackage := range expectedPackages {
 					if actual.Name == expectedPackage.Name &&
 						versionsMatch(expectedPackage.Version, actual.Version) &&
-						parameterizationsMatch(expectedPackage.Parameterization, actual.Parameterization) {
+						parameterizationsMatch(effectiveParam(expectedPackage), effectiveParam(actual)) {
 						found = true
 						break
 					}
@@ -1519,7 +1579,11 @@ func runLanguageTests(
 		}
 
 		updateOptions := run.UpdateOptions
-		updateOptions.Host = pctx.Host
+		updateOptions.HostFactory = func(
+			ctx context.Context, d, statusD diag.Sink, debug plugin.DebugContext,
+		) (plugin.Host, error) {
+			return pctx.Host, nil
+		}
 
 		// Translate the policy pack option on the test to point to the paths given by the testdata
 		if len(run.PolicyPacks) > 0 && token.PolicyPackDirectory == "" {
@@ -1563,7 +1627,7 @@ func runLanguageTests(
 					},
 				},
 			}}
-			_, err = languageClient.Link(ctx, policyInfo, linkDeps, grpcServer.Addr())
+			_, err = languageClient.Link(ctx, policyInfo, linkDeps, pctx.LoaderAddr())
 			if err != nil {
 				return makeTestResponse(fmt.Sprintf("link program: %v", err)), nil
 			}

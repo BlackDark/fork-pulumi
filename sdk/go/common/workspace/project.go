@@ -30,8 +30,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/pulumi/esc/ast"
-	"github.com/pulumi/esc/eval"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/esc/ast"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/esc/eval"
 	"github.com/texttheater/golang-levenshtein/levenshtein"
 
 	"github.com/hashicorp/go-multierror"
@@ -1247,16 +1247,6 @@ type ProjectRuntimeInfo struct {
 	options map[string]any
 }
 
-type ProjectStackDeployment struct {
-	DeploymentSettings apitype.DeploymentSettings `json:"settings" yaml:"settings"`
-}
-
-func (psd *ProjectStackDeployment) Save(path string) error {
-	contract.Requiref(path != "", "path", "must not be empty")
-	contract.Requiref(psd != nil, "ps", "must not be nil")
-	return save(path, psd, true /*mkDirAll*/)
-}
-
 func NewProjectRuntimeInfo(name string, options map[string]any) ProjectRuntimeInfo {
 	contract.Requiref(name != "", "name", "must not be empty")
 	return ProjectRuntimeInfo{
@@ -1402,8 +1392,6 @@ func (proj *Project) AddConfigStackTags(tags map[string]string) {
 		logging.Warningf("overwriting non-object `%s` project config", "pulumi:tags")
 		tagMap = map[string]string{}
 	}
-	for k, v := range tags {
-		tagMap[k] = v
-	}
+	maps.Copy(tagMap, tags)
 	proj.Config["pulumi:tags"] = configTags
 }

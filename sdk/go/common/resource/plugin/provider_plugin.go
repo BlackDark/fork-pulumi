@@ -30,6 +30,7 @@ import (
 	"github.com/grpc-ecosystem/grpc-opentracing/go/otgrpc"
 	multierror "github.com/hashicorp/go-multierror"
 	"github.com/opentracing/opentracing-go"
+	"go.opentelemetry.io/otel"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -41,6 +42,7 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/env"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/promise"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/providers"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/archive"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/asset"
@@ -83,7 +85,6 @@ type provider struct {
 	NotForwardCompatibleProvider
 
 	ctx                    *Context                         // a plugin context for caching, etc.
-	pkg                    tokens.Package                   // the Pulumi package containing this provider's resources.
 	plug                   *Plugin                          // the actual plugin process wrapper.
 	clientRaw              pulumirpc.ResourceProviderClient // the raw provider client; usually unsafe to use directly.
 	disableProviderPreview bool                             // true if previews for Create and Update are disabled.
@@ -146,7 +147,7 @@ func GetProviderAttachPort(pkg tokens.Package) (*int, error) {
 	var optAttach string
 
 	if providersEnvVar, has := os.LookupEnv("PULUMI_DEBUG_PROVIDERS"); has {
-		for _, provider := range strings.Split(providersEnvVar, ",") {
+		for provider := range strings.SplitSeq(providersEnvVar, ",") {
 			parts := strings.SplitN(provider, ":", 2)
 
 			if parts[0] == pkg.String() {
@@ -186,6 +187,9 @@ func NewProvider(host Host, ctx *Context, spec workspace.PluginDescriptor,
 	}
 
 	prefix := fmt.Sprintf("%v (resource)", pkg)
+	mapperAddr := mapperTarget(ctx)
+	loaderAddr := loaderTarget(ctx)
+	resolverAddr := resolverTarget(ctx)
 
 	if attachPort != nil {
 		port := *attachPort
@@ -202,6 +206,9 @@ func NewProvider(host Host, ctx *Context, spec workspace.PluginDescriptor,
 				SupportsViews:               true,
 				SupportsRefreshBeforeUpdate: supportsRefreshBeforeUpdate,
 				InvokeWithPreview:           true,
+				MapperTarget:                mapperAddr,
+				LoaderTarget:                loaderAddr,
+				ResolverTarget:              resolverAddr,
 			}
 			return handshake(ctx, bin, prefix, conn, req)
 		}
@@ -221,7 +228,7 @@ func NewProvider(host Host, ctx *Context, spec workspace.PluginDescriptor,
 		}
 	} else {
 		// Load the plugin's path by using the standard workspace logic.
-		path, err := workspace.GetPluginPath(ctx.baseContext, ctx.Diag, spec, host.GetProjectPlugins())
+		path, err := workspace.GetPluginPath(ctx.baseContext, ctx.Diag, spec, ctx.ProjectPlugins())
 		if err != nil {
 			return nil, err
 		}
@@ -265,6 +272,9 @@ func NewProvider(host Host, ctx *Context, spec workspace.PluginDescriptor,
 				SupportsViews:               true,
 				SupportsRefreshBeforeUpdate: supportsRefreshBeforeUpdate,
 				InvokeWithPreview:           true,
+				MapperTarget:                mapperAddr,
+				LoaderTarget:                loaderAddr,
+				ResolverTarget:              resolverAddr,
 			}
 			return handshake(ctx, bin, prefix, conn, req)
 		}
@@ -272,7 +282,8 @@ func NewProvider(host Host, ctx *Context, spec workspace.PluginDescriptor,
 		plug, handshakeRes, err = newPlugin(ctx, ctx.Pwd, path, prefix,
 			apitype.ResourcePlugin, []string{host.ServerAddr()}, e,
 			handshake, providerPluginDialOptions(ctx, pkg, ""),
-			host.AttachDebugger(DebugSpec{Type: DebugTypePlugin, Name: spec.Name}))
+			!ctx.DisableProviderDebugging() &&
+				host.AttachDebugger(DebugSpec{Type: DebugTypePlugin, Name: spec.Name}))
 		if err != nil {
 			return nil, err
 		}
@@ -289,7 +300,6 @@ func NewProvider(host Host, ctx *Context, spec workspace.PluginDescriptor,
 
 	p := &provider{
 		ctx:                    ctx,
-		pkg:                    pkg,
 		plug:                   plug,
 		clientRaw:              pulumirpc.NewResourceProviderClient(plug.Conn),
 		disableProviderPreview: disableProviderPreview,
@@ -319,6 +329,33 @@ func NewProvider(host Host, ctx *Context, spec workspace.PluginDescriptor,
 	return p, nil
 }
 
+// mapperTarget returns the context's mapper address as an optional handshake field, nil when the context has no
+// mapper service.
+func mapperTarget(ctx *Context) *string {
+	if addr := ctx.MapperAddr(); addr != "" {
+		return &addr
+	}
+	return nil
+}
+
+// loaderTarget returns the context's loader address as an optional handshake field, nil when the context has no
+// loader service.
+func loaderTarget(ctx *Context) *string {
+	if addr := ctx.LoaderAddr(); addr != "" {
+		return &addr
+	}
+	return nil
+}
+
+// resolverTarget returns the context's resolver address as an optional handshake field, nil when the context has no
+// resolver service.
+func resolverTarget(ctx *Context) *string {
+	if addr := ctx.ResolverAddr(); addr != "" {
+		return &addr
+	}
+	return nil
+}
+
 func handshake(
 	ctx context.Context,
 	bin string,
@@ -335,6 +372,9 @@ func handshake(
 		SupportsViews:               req.SupportsViews,
 		SupportsRefreshBeforeUpdate: req.SupportsRefreshBeforeUpdate,
 		InvokeWithPreview:           req.InvokeWithPreview,
+		MapperTarget:                req.MapperTarget,
+		LoaderTarget:                req.LoaderTarget,
+		ResolverTarget:              req.ResolverTarget,
 	})
 	if err != nil {
 		status, ok := status.FromError(err)
@@ -380,7 +420,10 @@ func providerPluginDialOptions(ctx *Context, pkg tokens.Package, path string) []
 }
 
 // NewProviderFromPath creates a new provider by loading the plugin binary located at `path`.
-func NewProviderFromPath(host Host, ctx *Context, pkg tokens.Package, path string) (Provider, error) {
+func NewProviderFromPath(host Host, ctx *Context, path string) (Provider, error) {
+	mapperAddr := mapperTarget(ctx)
+	loaderAddr := loaderTarget(ctx)
+	resolverAddr := resolverTarget(ctx)
 	handshake := func(
 		ctx context.Context, bin string, prefix string, conn *grpc.ClientConn,
 	) (*ProviderHandshakeResponse, error) {
@@ -393,6 +436,9 @@ func NewProviderFromPath(host Host, ctx *Context, pkg tokens.Package, path strin
 			SupportsViews:               true,
 			SupportsRefreshBeforeUpdate: supportsRefreshBeforeUpdate,
 			InvokeWithPreview:           true,
+			MapperTarget:                mapperAddr,
+			LoaderTarget:                loaderAddr,
+			ResolverTarget:              resolverAddr,
 		}
 		return handshake(ctx, bin, prefix, conn, req)
 	}
@@ -400,7 +446,8 @@ func NewProviderFromPath(host Host, ctx *Context, pkg tokens.Package, path strin
 	plug, handshakeRes, err := newPlugin(ctx, ctx.Pwd, path, "",
 		apitype.ResourcePlugin, []string{host.ServerAddr()}, env.Global(),
 		handshake, providerPluginDialOptions(ctx, "", path),
-		host.AttachDebugger(DebugSpec{Type: DebugTypePlugin, Name: path}))
+		!ctx.DisableProviderDebugging() &&
+			host.AttachDebugger(DebugSpec{Type: DebugTypePlugin, Name: path}))
 	if err != nil {
 		return nil, err
 	}
@@ -414,7 +461,6 @@ func NewProviderFromPath(host Host, ctx *Context, pkg tokens.Package, path strin
 		clientRaw:     pulumirpc.NewResourceProviderClient(plug.Conn),
 		legacyPreview: legacyPreview,
 		configSource:  &promise.CompletionSource[pluginConfig]{},
-		pkg:           pkg,
 	}
 
 	if handshakeRes != nil {
@@ -451,24 +497,22 @@ func (p *cancelOnCloseProvider) Close() error {
 	return p.Provider.Close()
 }
 
-func NewProviderWithClient(ctx *Context, pkg tokens.Package, client pulumirpc.ResourceProviderClient,
+func NewProviderWithClient(ctx *Context, client pulumirpc.ResourceProviderClient,
 	disableProviderPreview bool,
 ) Provider {
 	return &provider{
 		ctx:                    ctx,
-		pkg:                    pkg,
 		clientRaw:              client,
 		disableProviderPreview: disableProviderPreview,
 		configSource:           &promise.CompletionSource[pluginConfig]{},
 	}
 }
 
-func NewProviderWithVersionOverride(ctx *Context, pkg tokens.Package, client pulumirpc.ResourceProviderClient,
+func NewProviderWithVersionOverride(ctx *Context, client pulumirpc.ResourceProviderClient,
 	disableProviderPreview bool, version *semver.Version,
 ) Provider {
 	return &provider{
 		ctx:                    ctx,
-		pkg:                    pkg,
 		clientRaw:              client,
 		disableProviderPreview: disableProviderPreview,
 		configSource:           &promise.CompletionSource[pluginConfig]{},
@@ -476,11 +520,9 @@ func NewProviderWithVersionOverride(ctx *Context, pkg tokens.Package, client pul
 	}
 }
 
-func (p *provider) Pkg() tokens.Package { return p.pkg }
-
 // label returns a base label for tracing functions.
 func (p *provider) label() string {
-	return fmt.Sprintf("Provider[%s, %p]", p.pkg, p)
+	return fmt.Sprintf("Provider[%p]", p)
 }
 
 func (p *provider) requestContext() context.Context {
@@ -524,6 +566,9 @@ func (p *provider) Handshake(ctx context.Context, req ProviderHandshakeRequest) 
 		SupportsViews:               req.SupportsViews,
 		SupportsRefreshBeforeUpdate: req.SupportsRefreshBeforeUpdate,
 		InvokeWithPreview:           req.InvokeWithPreview,
+		MapperTarget:                req.MapperTarget,
+		LoaderTarget:                req.LoaderTarget,
+		ResolverTarget:              req.ResolverTarget,
 	})
 	if err != nil {
 		return nil, err
@@ -572,6 +617,9 @@ func (p *provider) Parameterize(ctx context.Context, request ParameterizeRequest
 
 // GetSchema fetches the schema for this resource provider, if any.
 func (p *provider) GetSchema(ctx context.Context, req GetSchemaRequest) (GetSchemaResponse, error) {
+	_, span := otel.Tracer("pulumi-cli").Start(ctx, "provider.GetSchema")
+	defer span.End()
+
 	var subpackageVersion string
 	if req.SubpackageVersion != nil {
 		subpackageVersion = req.SubpackageVersion.String()
@@ -789,7 +837,7 @@ func (p *provider) DiffConfig(ctx context.Context, req DiffConfigRequest) (DiffC
 		// exposed this issue with the kubernetes provider, new versions will be fixed to not error on
 		// this (https://github.com/pulumi/pulumi-kubernetes/issues/2663) but so that the CLI continues to
 		// work for old versions we have an explicit ignore for this one error here.
-		if p.pkg == "kubernetes" &&
+		if providers.GetProviderPackage(req.URN.Type()) == "kubernetes" &&
 			strings.Contains(rpcError.Error(), "cannot unmarshal string into Go value of type struct") {
 			logging.V(8).Infof("%s ignoring error from kubernetes provider", label)
 			return DiffResult{Changes: DiffUnknown}, nil
@@ -979,9 +1027,15 @@ func (p *provider) Configure(ctx context.Context, req ConfigureRequest) (Configu
 	label := p.label() + ".Configure()"
 	logging.V(7).Infof("%s executing (#vars=%d)", label, len(req.Inputs))
 
-	// Convert the inputs to a config map. If any are unknown, do not configure the underlying plugin: instead, leave
+	// The deprecated `variables` field is keyed by `<pkg>:config:<key>` for providers that still read config
+	// under the old name. The plugin no longer knows its own package, so we take it from the provider type the
+	// engine supplies at configure time.
+	contract.Assertf(req.Type != nil, "ConfigureRequest.Type must be set")
+	pkg := providers.GetProviderPackage(*req.Type)
+
+	// Convert the inputs to a variables map. If any are unknown, do not configure the underlying plugin: instead, leave
 	// the cfgknown bit unset and carry on.
-	config := make(map[string]string)
+	variables := make(map[string]string)
 	for k, v := range req.Inputs {
 		if k == "version" {
 			continue
@@ -1009,9 +1063,7 @@ func (p *provider) Configure(ctx context.Context, req ConfigureRequest) (Configu
 			mapped = string(marshalled)
 		}
 
-		// Pass the older spelling of a configuration key across the RPC interface, for now, to support
-		// providers which are on the older plan.
-		config[string(p.Pkg())+":config:"+string(k)] = mapped.(string)
+		variables[string(pkg)+":config:"+string(k)] = mapped.(string)
 	}
 
 	minputs, err := MarshalProperties(req.Inputs, MarshalOptions{
@@ -1053,7 +1105,7 @@ func (p *provider) Configure(ctx context.Context, req ConfigureRequest) (Configu
 			AcceptResources:        true,
 			SendsOldInputs:         true,
 			SendsOldInputsToDelete: true,
-			Variables:              config,
+			Variables:              variables,
 			Args:                   minputs,
 		})
 		if err != nil {
@@ -1402,7 +1454,7 @@ func (p *provider) Create(ctx context.Context, req CreateRequest) (CreateRespons
 
 	if id == "" && !req.Preview {
 		return CreateResponse{Status: resource.StatusUnknown},
-			fmt.Errorf("plugin for package '%v' returned empty resource.ID from create '%v'", p.pkg, req.URN)
+			fmt.Errorf("plugin returned empty resource.ID from create '%v'", req.URN)
 	}
 
 	outs, err := UnmarshalProperties(liveObject, MarshalOptions{
@@ -1514,6 +1566,7 @@ func (p *provider) Read(ctx context.Context, req ReadRequest) (ReadResponse, err
 		Type:                  req.URN.Type().String(),
 		Properties:            mstate,
 		Inputs:                minputs,
+		Timeout:               req.Timeout,
 		ResourceStatusAddress: req.ResourceStatusAddress,
 		ResourceStatusToken:   req.ResourceStatusToken,
 		OldViews:              oldViews,
@@ -1995,7 +2048,8 @@ func (p *provider) Construct(ctx context.Context, req ConstructRequest) (Constru
 	// Marshal the replacement trigger.
 	var replacementTrigger *structpb.Value
 	if !req.Options.ReplacementTrigger.IsNull() {
-		trigger, err := MarshalPropertyValue("replacementTrigger", req.Options.ReplacementTrigger, MarshalOptions{
+		value := resource.ToResourcePropertyValue(req.Options.ReplacementTrigger)
+		trigger, err := MarshalPropertyValue("replacementTrigger", value, MarshalOptions{
 			Label:            label + ".replacementTrigger",
 			KeepUnknowns:     req.Info.DryRun,
 			KeepSecrets:      true,
@@ -2080,6 +2134,7 @@ func (p *provider) Construct(ctx context.Context, req ConstructRequest) (Constru
 			Create: ct.Create,
 			Update: ct.Update,
 			Delete: ct.Delete,
+			Read:   ct.Read,
 		}
 	}
 

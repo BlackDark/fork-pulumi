@@ -39,6 +39,7 @@ import (
 	// We need to re-use glogs flags otherwise we'd get conflicts if another dependency pulled in glog later.
 	_ "github.com/golang/glog"
 
+	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/sig"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
 )
 
@@ -58,11 +59,12 @@ var (
 )
 
 var (
-	handlerMu   sync.RWMutex
-	primary     slog.Handler = discardHandler{} // regular log output (stderr / file)
-	sinkHandler slog.Handler                    // encrypted log handler, nil when inactive
-	logFilePath string
-	logFile     *os.File
+	handlerMu     sync.RWMutex
+	primary       slog.Handler = discardHandler{} // regular log output (stderr / file)
+	sinkHandler   slog.Handler                    // encrypted log handler, nil when inactive
+	exportHandler slog.Handler                    // OTLP export handler, nil when inactive
+	logFilePath   string
+	logFile       *os.File
 )
 
 func init() {
@@ -74,11 +76,71 @@ func init() {
 // handlerMu held for writing. slog.SetDefault is safe for concurrent use
 // with readers, so no additional synchronisation is needed.
 func rebuildLogger() {
-	var h slog.Handler = formattingHandler{inner: filteringHandler{inner: primary}}
-	if sinkHandler != nil {
-		h = &teeHandler{primary: h, sink: sinkHandler}
-	}
+	var p slog.Handler = verbosityHandler{inner: formattingHandler{inner: primary}}
+	var h slog.Handler = filteringHandler{inner: &teeHandler{
+		primary:  p,
+		sink:     sinkHandler,
+		exporter: exportHandler,
+	}}
 	slog.SetDefault(slog.New(h))
+}
+
+// logRedactable is implemented by attribute values (such as the property types) that know how to
+// replace their secret contents for plaintext log output. Only the primary (stderr or log file)
+// output redacts; the sink and export handlers receive unredacted records.
+type logRedactable interface {
+	RedactedLogValue() slog.Value
+}
+
+func redactAttr(a slog.Attr) slog.Attr {
+	if k := a.Value.Kind(); k != slog.KindAny && k != slog.KindLogValuer {
+		return a
+	}
+	switch v := a.Value.Any().(type) {
+	case logRedactable:
+		a.Value = v.RedactedLogValue()
+	case map[string]any:
+		a.Value = slog.AnyValue(redactSecretsInJSON(v))
+	case []any:
+		a.Value = slog.AnyValue(redactSecretsInJSON(v))
+	}
+	return a
+}
+
+// redactSecretsInJSON walks an already-serialized JSON value and replaces any object carrying the
+// Pulumi secret signature with "[secret]". Unlike the in-place walk `pulumi logs share` uses on
+// records it owns, this copies: the original value is shared with the unredacted sink and export
+// log outputs.
+func redactSecretsInJSON(v any) any {
+	switch val := v.(type) {
+	case map[string]any:
+		if s, ok := val[sig.Key].(string); ok && s == sig.Secret {
+			return "[secret]"
+		}
+		redacted := make(map[string]any, len(val))
+		for k, child := range val {
+			redacted[k] = redactSecretsInJSON(child)
+		}
+		return redacted
+	case []any:
+		redacted := make([]any, len(val))
+		for i, child := range val {
+			redacted[i] = redactSecretsInJSON(child)
+		}
+		return redacted
+	default:
+		return val
+	}
+}
+
+// SetExportHandler installs an slog.Handler for OTLP log export.
+// The handler receives a copy of every log record.  Pass nil to
+// remove the export handler.
+func SetExportHandler(h slog.Handler) {
+	handlerMu.Lock()
+	defer handlerMu.Unlock()
+	exportHandler = h
+	rebuildLogger()
 }
 
 // SetSinkHandler installs an additional slog.Handler that receives a
@@ -100,6 +162,19 @@ func sinkEnabled(level slog.Level) bool {
 }
 
 const LevelTrace = slog.LevelDebug - 4
+
+func verbosityLevel(verbose int) slog.Level {
+	switch {
+	case verbose >= 11:
+		return LevelTrace
+	case verbose >= 10:
+		return slog.LevelDebug
+	case verbose >= 1:
+		return slog.LevelInfo
+	default:
+		return slog.LevelWarn
+	}
+}
 
 // VerboseLogger logs messages only if verbosity matches the level it was built with.
 type VerboseLogger struct{ level int32 }
@@ -202,25 +277,32 @@ func InitLogging(logToStderr bool, verbose int, logFlow bool) {
 	} else if f := flag.CommandLine.Lookup("v"); f != nil {
 		fmt.Sscan(f.Value.String(), &Verbose) //nolint:errcheck
 	}
+	initExportHandler(filepath.Base(os.Args[0]))
 
 	handlerMu.Lock()
-	defer handlerMu.Unlock()
 
-	if LogToStderr {
+	switch {
+	case exportHandler != nil:
+		// Logs already flow to the engine over OTel, so skip local output:
+		// a log file would only duplicate them, and writing JSON records to
+		// stderr would leak them into the engine's display of our output.
+		primary = discardHandler{}
+	case LogToStderr:
 		primary = slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
-			Level: LevelTrace,
+			Level: verbosityLevel(Verbose),
 		})
-	} else if Verbose > 0 {
+	case Verbose > 0:
 		f, err := os.Create(logFileName())
 		if err == nil {
 			logFilePath = f.Name()
 			logFile = f
 			primary = slog.NewJSONHandler(f, &slog.HandlerOptions{
-				Level: LevelTrace,
+				Level: verbosityLevel(Verbose),
 			})
 		}
 	}
 	rebuildLogger()
+	handlerMu.Unlock()
 }
 
 // logFileName returns a log file path matching the glog naming convention:
@@ -245,8 +327,9 @@ func logFileName() string {
 	return filepath.Join(os.TempDir(), name)
 }
 
-// Flush flushes any pending log I/O.
+// Flush flushes any pending log I/O and shuts down the export handler.
 func Flush() {
+	shutdownExportHandler()
 	if logFile != nil {
 		logFile.Sync() //nolint:errcheck
 	}
@@ -259,34 +342,60 @@ func GetLogfilePath() (string, error) {
 	return "", errors.New("no log files found")
 }
 
-// teeHandler fans out slog records to two handlers.
+// teeHandler fans out slog records to a primary handler and optional
+// sink/export handlers.
 type teeHandler struct {
-	primary slog.Handler
-	sink    slog.Handler
+	primary  slog.Handler
+	sink     slog.Handler // encrypted log, nil when inactive
+	exporter slog.Handler // OTLP export, nil when inactive
 }
 
 func (t *teeHandler) Enabled(ctx context.Context, level slog.Level) bool {
-	return t.primary.Enabled(ctx, level) || t.sink.Enabled(ctx, level)
+	if t.primary.Enabled(ctx, level) {
+		return true
+	}
+	if t.sink != nil && t.sink.Enabled(ctx, level) {
+		return true
+	}
+	if t.exporter != nil && t.exporter.Enabled(ctx, level) {
+		return true
+	}
+	return false
 }
 
 func (t *teeHandler) Handle(ctx context.Context, r slog.Record) error {
 	if t.primary.Enabled(ctx, r.Level) {
 		_ = t.primary.Handle(ctx, r)
 	}
-	if t.sink.Enabled(ctx, r.Level) {
+	if t.sink != nil && t.sink.Enabled(ctx, r.Level) {
 		_ = t.sink.Handle(ctx, r)
+	}
+	if t.exporter != nil && t.exporter.Enabled(ctx, r.Level) {
+		_ = t.exporter.Handle(ctx, r)
 	}
 	return nil
 }
 
 func (t *teeHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	p := t.primary.WithAttrs(attrs)
-	s := t.sink.WithAttrs(attrs)
-	return &teeHandler{primary: p, sink: s}
+	result := &teeHandler{primary: t.primary.WithAttrs(attrs)}
+	if t.sink != nil {
+		result.sink = t.sink.WithAttrs(attrs)
+	}
+	if t.exporter != nil {
+		result.exporter = t.exporter.WithAttrs(attrs)
+	}
+	return result
 }
 
 func (t *teeHandler) WithGroup(name string) slog.Handler {
-	return &teeHandler{primary: t.primary.WithGroup(name), sink: t.sink.WithGroup(name)}
+	result := &teeHandler{primary: t.primary.WithGroup(name)}
+	if t.sink != nil {
+		result.sink = t.sink.WithGroup(name)
+	}
+	if t.exporter != nil {
+		result.exporter = t.exporter.WithGroup(name)
+	}
+	return result
 }
 
 // formattingHandler reconstructs the formatted message from
@@ -306,6 +415,7 @@ func (f formattingHandler) Handle(ctx context.Context, r slog.Record) error {
 	var fmtArgs []any
 	var other []slog.Attr
 	r.Attrs(func(a slog.Attr) bool {
+		a = redactAttr(a)
 		if strings.HasPrefix(a.Key, "pulumi.log.arg") {
 			fmtArgs = append(fmtArgs, a.Value.Any())
 		} else {
@@ -325,7 +435,11 @@ func (f formattingHandler) Handle(ctx context.Context, r slog.Record) error {
 }
 
 func (f formattingHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	return formattingHandler{inner: f.inner.WithAttrs(attrs)}
+	redacted := make([]slog.Attr, len(attrs))
+	for i, a := range attrs {
+		redacted[i] = redactAttr(a)
+	}
+	return formattingHandler{inner: f.inner.WithAttrs(redacted)}
 }
 
 func (f formattingHandler) WithGroup(name string) slog.Handler {
@@ -392,6 +506,42 @@ func FilterString(msg string) string {
 	}
 
 	return msg
+}
+
+// verbosityHandler drops records whose "v" attribute exceeds the requested -v level before they
+// reach the primary log output. Records carry their original pulumi verbosity in the "v"
+// attribute, while their slog levels are bucketed too coarsely (V(1)-V(9) all map to Info) for
+// level-based filtering alone. Only the primary output filters by verbosity; the sink and export
+// handlers receive every record.
+type verbosityHandler struct {
+	inner slog.Handler
+}
+
+func (h verbosityHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return h.inner.Enabled(ctx, level)
+}
+
+func (h verbosityHandler) Handle(ctx context.Context, r slog.Record) error {
+	drop := false
+	r.Attrs(func(a slog.Attr) bool {
+		if a.Key == "v" && a.Value.Kind() == slog.KindInt64 {
+			drop = a.Value.Int64() > int64(Verbose)
+			return false
+		}
+		return true
+	})
+	if drop {
+		return nil
+	}
+	return h.inner.Handle(ctx, r)
+}
+
+func (h verbosityHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return verbosityHandler{inner: h.inner.WithAttrs(attrs)}
+}
+
+func (h verbosityHandler) WithGroup(name string) slog.Handler {
+	return verbosityHandler{inner: h.inner.WithGroup(name)}
 }
 
 type discardHandler struct{}

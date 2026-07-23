@@ -77,12 +77,12 @@ jobs:
           echo "$TOOL_BIN" | tee -a "$GITHUB_PATH"
           command -v tar
           tar --version
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           ref: ${{ inputs.ref }}
       - name: Configure Go Cache Key
         env:
-          CACHE_KEY: "${{ fromJson(inputs.version-set).go }}-${{ runner.os }}-${{ runner.arch }}"
+          CACHE_KEY: "${{ fromJson(inputs.version-set).go }}-${{ runner.os }}-${{ runner.arch }}-target-${{ inputs.os }}-${{ inputs.arch }}-cov-${{ inputs.enable-coverage && inputs.os == 'linux' }}-race-${{ inputs.enable-race-detection }}"
         run: echo "$CACHE_KEY" > .gocache.tmp
       - uses: actions/setup-go@v6
         with:
@@ -128,12 +128,14 @@ jobs:
           cat .goreleaser.yml \
             | go run github.com/t0yv0/goreleaser-filter@v0.3.0 -goos ${{ inputs.os }} -goarch ${{ inputs.arch }} \
             | goreleaser release -f - -p 5 --skip=validate --clean --snapshot
-      - uses: actions/upload-artifact@v7
+      - uses: ./.github/actions/retry
         if: ${{ inputs.os != 'js' }}
         with:
-          name: artifacts-cli-${{ inputs.os }}-${{ inputs.arch }}${{ inputs.artifact-suffix || ''}}
-          overwrite: true
-          retention-days: 7
-          path: |
-            goreleaser/*.tar.gz
-            goreleaser/*.zip
+          action: actions/upload-artifact@v7
+          with: |
+            name: artifacts-cli-${{ inputs.os }}-${{ inputs.arch }}${{ inputs.artifact-suffix || ''}}
+            overwrite: true
+            retention-days: 7
+            path: |
+              goreleaser/*.tar.gz
+              goreleaser/*.zip

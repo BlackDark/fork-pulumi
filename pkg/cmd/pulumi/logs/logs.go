@@ -35,11 +35,11 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag/colors"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/cmdutil"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 )
 
 func NewLogsCmd(ws pkgWorkspace.Context) *cobra.Command {
 	var stackName string
+	var configFile string
 	var follow bool
 	var since string
 	var resource string
@@ -61,7 +61,7 @@ func NewLogsCmd(ws pkgWorkspace.Context) *cobra.Command {
 			}
 
 			// Fetch the project.
-			proj, _, err := ws.ReadProject()
+			proj, _, err := ws.ReadProject("")
 			if err != nil {
 				return err
 			}
@@ -74,12 +74,13 @@ func NewLogsCmd(ws pkgWorkspace.Context) *cobra.Command {
 				stackName,
 				cmdStack.LoadOnly,
 				opts,
+				configFile,
 			)
 			if err != nil {
 				return err
 			}
 
-			cfg, sm, err := config.GetStackConfiguration(ctx, cmdutil.Diag(), ssml, s, proj)
+			cfg, sm, err := config.GetStackConfiguration(ctx, cmdutil.Diag(), ssml, s, proj, configFile, nil)
 			if err != nil {
 				return fmt.Errorf("getting stack configuration: %w", err)
 			}
@@ -88,7 +89,7 @@ func NewLogsCmd(ws pkgWorkspace.Context) *cobra.Command {
 			encrypter := sm.Encrypter()
 
 			stackName := s.Ref().Name().String()
-			configErr := workspace.ValidateStackConfigAndApplyProjectConfig(
+			configErr := pkgWorkspace.ValidateStackConfigAndApplyProjectConfig(
 				ctx,
 				stackName,
 				proj,
@@ -136,7 +137,7 @@ func NewLogsCmd(ws pkgWorkspace.Context) *cobra.Command {
 					return fmt.Errorf("failed to get logs: %w", err)
 				}
 
-				// When we are emitting a fixed number of log entries, and outputing JSON, wrap them in an array.
+				// When we are emitting a fixed number of log entries, and outputting JSON, wrap them in an array.
 				if !follow && jsonOut {
 					entries := slice.Prealloc[logEntryJSON](len(logs))
 
@@ -196,12 +197,15 @@ func NewLogsCmd(ws pkgWorkspace.Context) *cobra.Command {
 	constrictor.AttachArguments(logsCmd, constrictor.NoArgs)
 
 	logsCmd.AddCommand(newDecryptCmd(ws))
+	logsCmd.AddCommand(newListCmd())
+	logsCmd.AddCommand(newRemoveCmd())
+	logsCmd.AddCommand(newShareCmd(ws, &stackName, createEncryptionSessionFromAPI))
 
 	logsCmd.PersistentFlags().StringVarP(
 		&stackName, "stack", "s", "",
 		"The name of the stack to operate on. Defaults to the current stack")
 	logsCmd.PersistentFlags().StringVar(
-		&cmdStack.ConfigFile, "config-file", "",
+		&configFile, "config-file", "",
 		"Use the configuration values in the specified file rather than detecting the file name")
 	logsCmd.PersistentFlags().BoolVarP(
 		&jsonOut, "json", "j", false, "Emit output as JSON")

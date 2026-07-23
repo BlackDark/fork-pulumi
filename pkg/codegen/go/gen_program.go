@@ -45,7 +45,6 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/common/encoding"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/util/maputil"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 )
 
@@ -288,14 +287,14 @@ func (g *generator) genComponentArgs(w io.Writer, componentName string, componen
 	argsTypeName := Title(componentName) + "Args"
 
 	objectTypedConfigVars := collectObjectTypedConfigVariables(component)
-	variableNames := maputil.SortedKeys(objectTypedConfigVars)
+	variableNames := slices.Sorted(maps.Keys(objectTypedConfigVars))
 	// generate resource args for this component
 	for _, variableName := range variableNames {
 		objectType := objectTypedConfigVars[variableName]
 		objectTypeName := configObjectTypeName(variableName)
 		g.Fprintf(w, "type %s struct {\n", objectTypeName)
 		g.Indented(func() {
-			propertyNames := maputil.SortedKeys(objectType.Properties)
+			propertyNames := slices.Sorted(maps.Keys(objectType.Properties))
 			for _, propertyName := range propertyNames {
 				propertyType := objectType.Properties[propertyName]
 				inputType := componentInputType(propertyType)
@@ -550,6 +549,7 @@ func GenerateProgramWithOptions(program *pcl.Program, opts GenerateProgramOption
 
 		componentFilename := filepath.Base(componentDir)
 		componentName := component.DeclarationName()
+		pcl.MapProvidersAsResources(component.Program)
 		componentGenerator, err := newGenerator(component.Program, opts)
 		componentGenerator.isComponent = true
 		for _, n := range component.Program.Nodes {
@@ -708,7 +708,7 @@ func GenerateProjectFiles(project workspace.Project, program *pcl.Program,
 
 	// For any local dependencies, add a replace statement. Make sure we iter this in sorted order (c.f.
 	// https://github.com/pulumi/pulumi/issues/16859).
-	pkgs := maputil.SortedKeys(localDependencies)
+	pkgs := slices.Sorted(maps.Keys(localDependencies))
 	for _, pkg := range pkgs {
 		path := localDependencies[pkg]
 		// pkg is the package name, we transformed these into Go paths above so use the map generated there
@@ -910,6 +910,10 @@ func (g *generator) collectImports(program *pcl.Program) (helpers codegen.String
 			} else {
 				mod = g.resolveModule(token)
 			}
+			// Extension resources import the extension's SDK package, not the base.
+			if r.Schema != nil && r.Schema.PackageReference != nil {
+				pkg = r.Schema.PackageReference.Name()
+			}
 			vPath, err := g.getVersionPath(program, pkg)
 			if err != nil {
 				if r.Schema != nil {
@@ -926,6 +930,9 @@ func (g *generator) collectImports(program *pcl.Program) (helpers codegen.String
 				continue
 			}
 			mod := g.resolveModule(token)
+			if r.Schema != nil && r.Schema.PackageReference != nil {
+				pkg = r.Schema.PackageReference.Name()
+			}
 			vPath, err := g.getVersionPath(program, pkg)
 			if err != nil {
 				if r.Schema != nil {
@@ -957,6 +964,7 @@ func (g *generator) collectImports(program *pcl.Program) (helpers codegen.String
 
 					contract.Assertf(len(diagnostics) == 0, "Expected no diagnostics, got %d", len(diagnostics))
 
+					pkg = g.functionPackage(token)
 					vPath, err := g.getVersionPath(program, pkg)
 					if err != nil {
 						panic(err)
@@ -1138,7 +1146,7 @@ func (g *generator) addPulumiImport(pkg, versionPath, mod, name string) {
 
 		if strings.Contains(pkgName, "-") {
 			var alias strings.Builder
-			for _, part := range strings.Split(pkgName, "-") {
+			for part := range strings.SplitSeq(pkgName, "-") {
 				alias.WriteString(strcase.ToLowerCamel(part))
 			}
 			pkgName = alias.String()
@@ -1234,6 +1242,36 @@ func (g *generator) genHookNode(w io.Writer, h *pcl.Hook) {
 	var cmdExprs []model.Expression
 	if tuple, ok := h.Command.(*model.TupleConsExpression); ok {
 		cmdExprs = tuple.Expressions
+	}
+
+	if h.Kind == pcl.HookKindError {
+		// Error hooks return whether the failed operation should be retried: retry if and
+		// only if the command exits successfully.
+		g.Fgenf(w, "%s%s, err := ctx.RegisterErrorHook(%q, func(args *pulumi.ErrorHookArgs) (bool, error) {\n",
+			g.Indent, varName, hookName)
+		g.Indented(func() {
+			if len(cmdExprs) > 0 {
+				g.Fgenf(w, "%sreturn exec.Command(%v", g.Indent, cmdExprs[0])
+				for _, arg := range cmdExprs[1:] {
+					g.Fgenf(w, ", %v", arg)
+				}
+				g.Fgenf(w, ").Run() == nil, nil\n")
+			} else {
+				g.Fgenf(w, "%sreturn false, nil\n", g.Indent)
+			}
+		})
+		g.Fgenf(w, "%s})\n", g.Indent)
+		g.Fgenf(w, "%sif err != nil {\n", g.Indent)
+		g.Indented(func() {
+			if g.isComponent {
+				g.Fgenf(w, "%sreturn nil, err\n", g.Indent)
+			} else {
+				g.Fgenf(w, "%sreturn err\n", g.Indent)
+			}
+		})
+		g.Fgenf(w, "%s}\n", g.Indent)
+		g.isErrAssigned = true
+		return
 	}
 
 	g.Fgenf(w, "%s%s, err := ctx.RegisterResourceHook(%q, func(args *pulumi.ResourceHookArgs) error {\n",
@@ -1467,6 +1505,8 @@ func (g *generator) genResourceOptions(w io.Writer, block *model.Block) {
 					g.Fgenf(valBuffer, "Update: %v, ", item.Value)
 				case "delete":
 					g.Fgenf(valBuffer, "Delete: %v, ", item.Value)
+				case "read":
+					g.Fgenf(valBuffer, "Read: %v, ", item.Value)
 				}
 			}
 			g.Fgenf(valBuffer, "}")
@@ -1522,7 +1562,11 @@ func (g *generator) genResourceOptions(w io.Writer, block *model.Block) {
 				g.Fgenf(w, ", pulumi.ResourceHooks(&pulumi.ResourceHookBinding{")
 				for _, hookType := range hookTypes {
 					vars := hookVars[hookType]
-					g.Fgenf(w, "%s: []*pulumi.ResourceHook{%s}, ", Title(hookType), strings.Join(vars, ", "))
+					hookGoType := "ResourceHook"
+					if hookType == "onError" {
+						hookGoType = "ErrorHook"
+					}
+					g.Fgenf(w, "%s: []*pulumi.%s{%s}, ", Title(hookType), hookGoType, strings.Join(vars, ", "))
 				}
 				g.Fgenf(w, "})")
 			}
@@ -1548,6 +1592,10 @@ func (g *generator) genResource(w io.Writer, r *pcl.Resource) {
 	}
 	if pkg == "pulumi" && mod == "pulumi" {
 		mod = ""
+	}
+	// Extension resources are emitted from the extension's SDK package, not the base.
+	if r.Schema != nil && r.Schema.PackageReference != nil {
+		pkg = r.Schema.PackageReference.Name()
 	}
 	if mod == "" || strings.HasPrefix(mod, "/") || mod == IndexToken {
 		originalMod = mod
@@ -2287,6 +2335,20 @@ func (g *generator) genLocalVariable(w io.Writer, v *pcl.LocalVariable) {
 	case *model.FunctionCallExpression:
 		switch expr.Name {
 		case pcl.Invoke:
+			// Nested plain invokes return (T, error) so they cannot be used as inline
+			// expressions; spill them to temporary variables first.
+			if len(expr.Args) >= 2 {
+				args, invokeTemps := g.rewriteInlineInvokes(expr.Args[1])
+				expr.Args[1] = args
+				if len(invokeTemps) > 0 {
+					temps := slice.Prealloc[any](len(invokeTemps))
+					for _, t := range invokeTemps {
+						temps = append(temps, t)
+					}
+					g.genTemps(w, temps)
+				}
+			}
+
 			// OutputVersionedInvoke does not return an error
 			noError, _, _ := pcl.RecognizeOutputVersionedInvoke(expr)
 			if noError {
@@ -2375,7 +2437,7 @@ func (g *generator) genConfigVariable(w io.Writer, v *pcl.ConfigVariable) {
 	}
 
 	if v.Description != "" {
-		for _, line := range strings.Split(v.Description, "\n") {
+		for line := range strings.SplitSeq(v.Description, "\n") {
 			g.Fgenf(w, "%s// %s\n", g.Indent, line)
 		}
 	}

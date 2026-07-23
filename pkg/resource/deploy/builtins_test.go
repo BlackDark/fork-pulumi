@@ -18,11 +18,12 @@ import (
 	"context"
 	"testing"
 
+	pkgresource "github.com/pulumi/pulumi/pkg/v3/resource"
+
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy/deploytest"
+	"github.com/pulumi/pulumi/pkg/v3/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/urn"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 	"github.com/pulumi/pulumi/sdk/v3/go/property"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi-internal/gsync"
 	"github.com/stretchr/testify/assert"
@@ -35,11 +36,6 @@ func TestBuiltinProvider(t *testing.T) {
 		t.Parallel()
 		p := &builtinProvider{}
 		require.NoError(t, p.Close())
-	})
-	t.Run("Pkg", func(t *testing.T) {
-		t.Parallel()
-		p := &builtinProvider{}
-		assert.Equal(t, tokens.Package("pulumi"), p.Pkg())
 	})
 	t.Run("GetSchema", func(t *testing.T) {
 		t.Parallel()
@@ -240,11 +236,11 @@ func TestBuiltinProvider(t *testing.T) {
 				t.Parallel()
 
 				p := &builtinProvider{
-					news:  &gsync.Map[urn.URN, *resource.State]{},
-					reads: &gsync.Map[urn.URN, *resource.State]{},
+					news:  &gsync.Map[urn.URN, *pkgresource.State]{},
+					reads: &gsync.Map[urn.URN, *pkgresource.State]{},
 				}
 
-				expected := &resource.State{
+				expected := &pkgresource.State{
 					Outputs: resource.PropertyMap{
 						"foo": resource.NewProperty("bar"),
 					},
@@ -267,11 +263,11 @@ func TestBuiltinProvider(t *testing.T) {
 				t.Parallel()
 
 				p := &builtinProvider{
-					news:  &gsync.Map[urn.URN, *resource.State]{},
-					reads: &gsync.Map[urn.URN, *resource.State]{},
+					news:  &gsync.Map[urn.URN, *pkgresource.State]{},
+					reads: &gsync.Map[urn.URN, *pkgresource.State]{},
 				}
 
-				expected := &resource.State{
+				expected := &pkgresource.State{
 					Outputs: resource.PropertyMap{
 						"foo": resource.NewProperty("bar"),
 					},
@@ -293,8 +289,8 @@ func TestBuiltinProvider(t *testing.T) {
 			t.Run("err", func(t *testing.T) {
 				t.Parallel()
 				p := &builtinProvider{
-					news:  &gsync.Map[urn.URN, *resource.State]{},
-					reads: &gsync.Map[urn.URN, *resource.State]{},
+					news:  &gsync.Map[urn.URN, *pkgresource.State]{},
+					reads: &gsync.Map[urn.URN, *pkgresource.State]{},
 				}
 				_, err := p.Invoke(t.Context(), plugin.InvokeRequest{
 					Tok: getResource,

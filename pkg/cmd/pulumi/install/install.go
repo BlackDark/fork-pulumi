@@ -15,6 +15,7 @@
 package install
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -25,18 +26,26 @@ import (
 	cmdBackend "github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/backend"
 	cmdCmd "github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/cmd"
 	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/constrictor"
+	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/packageinstallation"
+	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/packageresolution"
+	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/packageworkspace"
 	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/policy"
 	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/project/newcmd"
+	"github.com/pulumi/pulumi/pkg/v3/pluginstorage"
+	"github.com/pulumi/pulumi/pkg/v3/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/env"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 
 	"github.com/spf13/cobra"
 
+	"github.com/pulumi/pulumi/pkg/v3/codegen/convert"
+	"github.com/pulumi/pulumi/pkg/v3/codegen/schema"
 	"github.com/pulumi/pulumi/pkg/v3/engine"
+	pkghost "github.com/pulumi/pulumi/pkg/v3/host"
 	pkgCmdUtil "github.com/pulumi/pulumi/pkg/v3/util/cmdutil"
 	pkgWorkspace "github.com/pulumi/pulumi/pkg/v3/workspace"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/cmdutil"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 )
 
 func NewInstallCmd(ws pkgWorkspace.Context) *cobra.Command {
@@ -102,7 +111,7 @@ func NewInstallCmd(ws pkgWorkspace.Context) *cobra.Command {
 					// plugin. Use the global default registry.
 					reg := cmdCmd.NewDefaultRegistry(
 						ctx, cmdBackend.DefaultLoginManager, pkgWorkspace.Instance, nil, cmdutil.Diag(), env.Global())
-					if err := newcmd.InstallPackagesFromProject(cmd.Context(), proj, cwd, reg, parallel,
+					if _, err := newcmd.InstallPackagesFromProject(cmd.Context(), proj, cwd, reg, parallel,
 						useLanguageVersionTools, cmd.OutOrStdout(), cmd.ErrOrStderr(), env.Global()); err != nil {
 						return fmt.Errorf("installing `packages` from PulumiPlugin.yaml: %w", err)
 					}
@@ -113,20 +122,29 @@ func NewInstallCmd(ws pkgWorkspace.Context) *cobra.Command {
 			}
 
 			// Load the project
-			proj, root, err := ws.ReadProject()
+			proj, root, err := ws.ReadProject("")
 			if err != nil {
 				return err
 			}
 
 			span := opentracing.SpanFromContext(ctx)
 			projinfo := &engine.Projinfo{Proj: proj, Root: root}
+			reg := cmdCmd.NewDefaultRegistry(
+				cmd.Context(), cmdBackend.DefaultLoginManager, pkgWorkspace.Instance, proj, cmdutil.Diag(), env.Global())
+			pluginHost, err := pkghost.New(
+				context.WithoutCancel(ctx), cmdutil.Diag(), cmdutil.Diag(), nil, pkgWorkspace.EnsureLanguageInstalled,
+				schema.NewLoaderServerFromContext, convert.NewMapperServerFromContext,
+				packageworkspace.NewResolverServer(reg))
+			if err != nil {
+				return err
+			}
+			defer contract.IgnoreClose(pluginHost) // host is owned here, closed after the context
 			pwd, main, pctx, err := engine.ProjectInfoContext(
 				ctx,
 				projinfo,
-				nil,
+				pluginHost,
 				cmdutil.Diag(),
 				cmdutil.Diag(),
-				nil,
 				false,
 				span,
 				nil,
@@ -141,16 +159,21 @@ func NewInstallCmd(ws pkgWorkspace.Context) *cobra.Command {
 			// so that the SDKs folder is present and references to it from package.json etc are valid.
 			registry := cmdCmd.NewDefaultRegistry(
 				cmd.Context(), cmdBackend.DefaultLoginManager, pkgWorkspace.Instance, proj, pctx.Diag, env.Global())
-			if err := newcmd.InstallPackagesFromProject(cmd.Context(), proj, root,
+			continuation, err := newcmd.InstallPackagesFromProject(cmd.Context(), proj, root,
 				registry, parallel, useLanguageVersionTools, cmd.OutOrStdout(), cmd.ErrOrStderr(), env.Global(),
-			); err != nil {
+			)
+			if err != nil {
 				return fmt.Errorf("installing `packages` from Pulumi.yaml: %w", err)
+			}
+
+			if proj.Runtime.Name() == "" {
+				return nil
 			}
 
 			// First make sure the language plugin is present.  We need this to load the required resource plugins.
 			// TODO: we need to think about how best to version this.  For now, it always picks the latest.
 			runtime := proj.Runtime
-			lang, err := pctx.Host.LanguageRuntime(runtime.Name())
+			lang, err := pctx.Host.LanguageRuntime(pctx, runtime.Name())
 			if err != nil {
 				return fmt.Errorf("load language plugin %s: %w", runtime.Name(), err)
 			}
@@ -170,19 +193,36 @@ func NewInstallCmd(ws pkgWorkspace.Context) *cobra.Command {
 
 			if !noPlugins {
 				// Compute the set of plugins the current project needs.
-				packages, err := lang.GetRequiredPackages(ctx, programInfo)
+				packages, specs, err := lang.GetRequiredPackages(ctx, programInfo)
 				if err != nil {
 					return err
 				}
 
-				pluginSet := engine.NewPluginSet()
-				for _, pkg := range packages {
-					pluginSet.Add(pkg.PluginDescriptor)
+				projPath, err := workspace.DetectProjectPathFrom(root)
+				if err != nil {
+					return fmt.Errorf("locating Pulumi.yaml: %w", err)
 				}
 
-				if err = engine.EnsurePluginsAreInstalled(ctx, nil, pctx.Diag, pluginSet,
-					pctx.Host.GetProjectPlugins(), reinstall, true); err != nil {
-					return err
+				ws := packageworkspace.New(pluginstorage.Instance, pkgWorkspace.Instance,
+					pctx, cmd.OutOrStderr(), cmd.ErrOrStderr(), nil,
+					packageworkspace.Options{
+						UseLanguageVersionTools: useLanguageVersionTools,
+					})
+
+				// Pass the continuation from InstallPackagesFromProject so the packages it
+				// already installed and linked are not reinstalled or regenerated here.
+				_, err = packageinstallation.InstallPluginSet(ctx, packages, specs, proj, filepath.Dir(projPath),
+					packageinstallation.Options{
+						Concurrency: parallel,
+						PriorState:  continuation,
+						Options: packageresolution.Options{
+							ResolveVersionWithLocalWorkspace:           true,
+							ResolveWithRegistry:                        !env.DisableRegistryResolve.Value(),
+							AllowNonInvertableLocalWorkspaceResolution: true,
+						},
+					}, registry, ws)
+				if err != nil {
+					return fmt.Errorf("installing packages: %w", err)
 				}
 			}
 
@@ -193,7 +233,7 @@ func NewInstallCmd(ws pkgWorkspace.Context) *cobra.Command {
 
 	cmd.Flags().IntVar(&parallel,
 		"parallel", 4, "The max number of concurrent installs to perform. "+
-			"Parallelism of less then 1 implies unbounded parallelism")
+			"Parallelism of less than 1 implies unbounded parallelism")
 	cmd.PersistentFlags().BoolVar(&reinstall,
 		"reinstall", false, "Reinstall a plugin even if it already exists")
 	cmd.PersistentFlags().BoolVar(&noPlugins,
@@ -201,7 +241,7 @@ func NewInstallCmd(ws pkgWorkspace.Context) *cobra.Command {
 	cmd.PersistentFlags().BoolVar(&noDependencies,
 		"no-dependencies", false, "Skip installing dependencies")
 	cmd.PersistentFlags().BoolVar(&useLanguageVersionTools,
-		"use-language-version-tools", false, "Use language version tools to setup and install the language runtime")
+		"use-language-version-tools", false, "Use language version tools to set up and install the language runtime")
 
 	return cmd
 }

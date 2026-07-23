@@ -16,29 +16,35 @@ package stack
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"reflect"
 	"slices"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	fxs "github.com/pgavlin/fx/v2/slices"
+	"go.opentelemetry.io/otel"
+
+	pkgresource "github.com/pulumi/pulumi/pkg/v3/resource"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
+	"github.com/pulumi/pulumi/pkg/v3/resource/stack/migrate"
 	"github.com/pulumi/pulumi/pkg/v3/secrets"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype/migrate"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/encoding"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/archive"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/asset"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/util/cmdutil"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/util/maputil"
 	"github.com/santhosh-tekuri/jsonschema/v5"
 )
 
@@ -64,11 +70,14 @@ const (
 	floatSignature = "8ad145fe-0d11-4827-bfd7-1abcbf086f5c"
 
 	// Feature names for deployment features.
-	refreshBeforeUpdateFeature = "refreshBeforeUpdate"
-	viewsFeature               = "views"
-	hooksFeature               = "hooks"
-	taintFeature               = "taint"
-	replaceWithFeature         = "replaceWith"
+	refreshBeforeUpdateFeature       = "refreshBeforeUpdate"
+	viewsFeature                     = "views"
+	hooksFeature                     = "hooks"
+	taintFeature                     = "taint"
+	replaceWithFeature               = "replaceWith"
+	snippetsFeature                  = "snippets-prototype"
+	extensionParameterizationFeature = "extensionParameterization"
+	byteStringFeature                = "byteString"
 )
 
 var (
@@ -120,11 +129,14 @@ func init() {
 // supportedFeatures is a map of features that are currently supported.
 // Any features not in this map will be rejected.
 var supportedFeatures = map[string]bool{
-	refreshBeforeUpdateFeature: true,
-	viewsFeature:               true,
-	hooksFeature:               true,
-	taintFeature:               true,
-	replaceWithFeature:         true,
+	refreshBeforeUpdateFeature:       true,
+	viewsFeature:                     true,
+	hooksFeature:                     true,
+	taintFeature:                     true,
+	replaceWithFeature:               true,
+	snippetsFeature:                  true,
+	extensionParameterizationFeature: true,
+	byteStringFeature:                true,
 }
 
 // validateSupportedFeatures validates that the features used in a deployment are supported.
@@ -142,7 +154,13 @@ func validateSupportedFeatures(features []string) error {
 }
 
 // ApplyFeatures applies the features used by a resource to the feature map.
-func ApplyFeatures(res apitype.ResourceV3, features map[string]bool) {
+//
+// Byte string inside secrets are encrypted away by serialization, so they cannot be detected from
+// the serialized resource; callers must pass encodedByteString as reported by SerializeResource.
+func ApplyFeatures(res apitype.ResourceV3, encodedByteString bool, features map[string]bool) {
+	if encodedByteString {
+		features[byteStringFeature] = true
+	}
 	if res.RefreshBeforeUpdate {
 		features[refreshBeforeUpdateFeature] = true
 	}
@@ -158,6 +176,44 @@ func ApplyFeatures(res apitype.ResourceV3, features map[string]bool) {
 	if len(res.ReplaceWith) > 0 {
 		features[replaceWithFeature] = true
 	}
+	if res.ExtensionRef != "" {
+		features[extensionParameterizationFeature] = true
+	}
+	if res.SnippetID != "" {
+		features[snippetsFeature] = true
+	}
+}
+
+// propertyValueNeedsByteString reports whether the value contains a string with bytes that are not
+// valid UTF-8. Such strings serialize with the byte string signature, which requires the
+// byteString feature so that older engines refuse to read state they would corrupt.
+func propertyValueNeedsByteString(v resource.PropertyValue) bool {
+	switch {
+	case v.IsString():
+		return !utf8.ValidString(v.StringValue())
+	case v.IsArray():
+		if slices.ContainsFunc(v.ArrayValue(), propertyValueNeedsByteString) {
+			return true
+		}
+	case v.IsObject():
+		return propertyMapNeedsByteString(v.ObjectValue())
+	case v.IsSecret():
+		return propertyValueNeedsByteString(v.SecretValue().Element)
+	case v.IsOutput():
+		return propertyValueNeedsByteString(v.OutputValue().Element)
+	case v.IsComputed():
+		return propertyValueNeedsByteString(v.Input().Element)
+	}
+	return false
+}
+
+func propertyMapNeedsByteString(m resource.PropertyMap) bool {
+	for _, v := range m {
+		if propertyValueNeedsByteString(v) {
+			return true
+		}
+	}
+	return false
 }
 
 // ValidateUntypedDeployment validates a deployment against the Deployment JSON schema.
@@ -212,19 +268,22 @@ func SerializeDeploymentWithMetadata(
 	// Serialize all vertices and only include a vertex section if non-empty.
 	resources := slice.Prealloc[apitype.ResourceV3](len(snap.Resources))
 	for _, res := range snap.Resources {
-		sres, err := SerializeResource(ctx, res, enc, showSecrets)
+		sres, encodedByteString, err := SerializeResource(ctx, res, enc, showSecrets)
 		if err != nil {
 			return nil, 0, nil, fmt.Errorf("serializing resources: %w", err)
 		}
-		ApplyFeatures(sres, featureMap)
+		ApplyFeatures(sres, encodedByteString, featureMap)
 		resources = append(resources, sres)
 	}
 
 	operations := slice.Prealloc[apitype.OperationV2](len(snap.PendingOperations))
 	for _, op := range snap.PendingOperations {
-		sop, err := SerializeOperation(ctx, op, enc, showSecrets)
+		sop, encodedByteString, err := SerializeOperation(ctx, op, enc, showSecrets)
 		if err != nil {
 			return nil, 0, nil, err
+		}
+		if encodedByteString {
+			featureMap[byteStringFeature] = true
 		}
 		operations = append(operations, sop)
 	}
@@ -246,13 +305,22 @@ func SerializeDeploymentWithMetadata(
 		}
 	}
 
+	var snippets []apitype.SnippetV1
+	if len(snap.Snippets) > 0 {
+		snippets = make([]apitype.SnippetV1, len(snap.Snippets))
+		for i, s := range snap.Snippets {
+			snippets[i] = SerializeSnippet(s)
+		}
+		featureMap[snippetsFeature] = true
+	}
+
 	if completeBatch != nil { // If we started a batch operation, complete it.
 		if err := completeBatch(ctx); err != nil {
 			return nil, 0, nil, err
 		}
 	}
 
-	features := maputil.SortedKeys(featureMap)
+	features := slices.Sorted(maps.Keys(featureMap))
 	if len(features) == 0 {
 		features = nil
 	}
@@ -268,7 +336,75 @@ func SerializeDeploymentWithMetadata(
 		SecretsProviders:  secretsProvider,
 		PendingOperations: operations,
 		Metadata:          metadata,
+		Snippets:          snippets,
+		Extensions:        snap.Extensions,
 	}, version, features, nil
+}
+
+// SerializeSnippet converts a resource.Snippet into its apitype representation.
+func SerializeSnippet(s resource.Snippet) apitype.SnippetV1 {
+	var refs map[string]string
+	if len(s.References) > 0 {
+		refs = make(map[string]string, len(s.References))
+		maps.Copy(refs, s.References)
+	}
+	return apitype.SnippetV1{
+		UUID:       s.UUID,
+		Name:       s.Name,
+		Type:       s.Type,
+		Code:       s.Code,
+		Descriptor: serializePackageDescriptor(s.Descriptor),
+		References: refs,
+	}
+}
+
+func serializePackageDescriptor(d resource.PackageDescriptor) apitype.PackageDescriptorV1 {
+	out := apitype.PackageDescriptorV1{
+		Name:        d.Name,
+		Version:     d.Version,
+		DownloadURL: d.DownloadURL,
+	}
+	if d.Parameterization != nil {
+		out.Parameterization = &apitype.ParameterizationDescriptorV1{
+			Name:    d.Parameterization.Name,
+			Version: d.Parameterization.Version,
+			Value:   d.Parameterization.Value,
+		}
+	}
+	return out
+}
+
+// DeserializeSnippet converts an apitype.SnippetV1 back into a resource.Snippet.
+func DeserializeSnippet(s apitype.SnippetV1) resource.Snippet {
+	var refs map[string]string
+	if len(s.References) > 0 {
+		refs = make(map[string]string, len(s.References))
+		maps.Copy(refs, s.References)
+	}
+	return resource.Snippet{
+		UUID:       s.UUID,
+		Name:       s.Name,
+		Type:       s.Type,
+		Code:       s.Code,
+		Descriptor: deserializePackageDescriptor(s.Descriptor),
+		References: refs,
+	}
+}
+
+func deserializePackageDescriptor(d apitype.PackageDescriptorV1) resource.PackageDescriptor {
+	out := resource.PackageDescriptor{
+		Name:        d.Name,
+		Version:     d.Version,
+		DownloadURL: d.DownloadURL,
+	}
+	if d.Parameterization != nil {
+		out.Parameterization = &resource.ParameterizationDescriptor{
+			Name:    d.Parameterization.Name,
+			Version: d.Parameterization.Version,
+			Value:   d.Parameterization.Value,
+		}
+	}
+	return out
 }
 
 // SerializeOptions controls how a deployment is serialized to JSON.
@@ -313,6 +449,10 @@ func UnmarshalUntypedDeployment(
 	ctx context.Context,
 	deployment *apitype.UntypedDeployment,
 ) (*apitype.DeploymentV3, error) {
+	tracer := otel.Tracer("pulumi-cli")
+	_, span := cmdutil.StartSpan(ctx, tracer, "stack.UnmarshalUntypedDeployment")
+	defer span.End()
+
 	contract.Requiref(deployment != nil, "deployment", "must not be nil")
 	switch {
 	case deployment.Version > DeploymentSchemaVersionLatest:
@@ -363,6 +503,10 @@ func DeserializeUntypedDeployment(
 	deployment *apitype.UntypedDeployment,
 	secretsProv secrets.Provider,
 ) (*deploy.Snapshot, error) {
+	tracer := otel.Tracer("pulumi-cli")
+	ctx, span := cmdutil.StartSpan(ctx, tracer, "stack.DeserializeUntypedDeployment")
+	defer span.End()
+
 	v3deployment, err := UnmarshalUntypedDeployment(ctx, deployment)
 	if err != nil {
 		return nil, err
@@ -377,6 +521,10 @@ func DeserializeStackOutputs(
 	deployment apitype.DeploymentV3,
 	secretsProv secrets.Provider,
 ) (resource.PropertyMap, error) {
+	tracer := otel.Tracer("pulumi-cli")
+	ctx, span := cmdutil.StartSpan(ctx, tracer, "stack.DeserializeStackOutputs")
+	defer span.End()
+
 	// Find the root stack resource in the deployment.
 	var stackResource *apitype.ResourceV3
 	for i := range deployment.Resources {
@@ -400,7 +548,8 @@ func DeserializeStackOutputs(
 		secretsManager,
 		func(ctx context.Context, dec config.Decrypter) (resource.PropertyMap, error) {
 			return DeserializeProperties(stackResource.Outputs, dec)
-		})
+		},
+	)
 }
 
 // DeserializeDeploymentV3 deserializes a typed DeploymentV3 into a `deploy.Snapshot`.
@@ -409,6 +558,10 @@ func DeserializeDeploymentV3(
 	deployment apitype.DeploymentV3,
 	secretsProv secrets.Provider,
 ) (*deploy.Snapshot, error) {
+	tracer := otel.Tracer("pulumi-cli")
+	ctx, span := cmdutil.StartSpan(ctx, tracer, "stack.DeserializeDeploymentV3")
+	defer span.End()
+
 	// Unpack the versions.
 	manifest, err := deploy.DeserializeManifest(deployment.Manifest)
 	if err != nil {
@@ -421,8 +574,8 @@ func DeserializeDeploymentV3(
 	}
 
 	type deserializedData struct {
-		resources []*resource.State
-		ops       []resource.Operation
+		resources []*pkgresource.State
+		ops       []pkgresource.Operation
 	}
 
 	data, err := BatchDecrypt(
@@ -430,7 +583,7 @@ func DeserializeDeploymentV3(
 		secretsManager,
 		func(ctx context.Context, dec config.Decrypter) (deserializedData, error) {
 			// For every serialized resource vertex, create a ResourceDeployment out of it.
-			resources := slice.Prealloc[*resource.State](len(deployment.Resources))
+			resources := slice.Prealloc[*pkgresource.State](len(deployment.Resources))
 			for _, res := range deployment.Resources {
 				desres, err := DeserializeResource(res, dec)
 				if err != nil {
@@ -439,7 +592,7 @@ func DeserializeDeploymentV3(
 				resources = append(resources, desres)
 			}
 
-			ops := slice.Prealloc[resource.Operation](len(deployment.PendingOperations))
+			ops := slice.Prealloc[pkgresource.Operation](len(deployment.PendingOperations))
 			for _, op := range deployment.PendingOperations {
 				desop, err := DeserializeOperation(op, dec)
 				if err != nil {
@@ -449,7 +602,8 @@ func DeserializeDeploymentV3(
 			}
 
 			return deserializedData{resources: resources, ops: ops}, nil
-		})
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -463,7 +617,16 @@ func DeserializeDeploymentV3(
 		}
 	}
 
-	return deploy.NewSnapshot(*manifest, secretsManager, data.resources, data.ops, metadata), nil
+	var snippets []resource.Snippet
+	if len(deployment.Snippets) > 0 {
+		snippets = make([]resource.Snippet, len(deployment.Snippets))
+		for i, s := range deployment.Snippets {
+			snippets[i] = DeserializeSnippet(s)
+		}
+	}
+	return deploy.NewSnapshot(
+		*manifest, secretsManager, data.resources, data.ops, metadata, snippets, deployment.Extensions,
+	), nil
 }
 
 // initializeSecretsManager initializes the secrets manager for a deployment.
@@ -488,22 +651,28 @@ func initializeSecretsManager(
 	return secretsManager, nil
 }
 
-// SerializeResource turns a resource into a structure suitable for serialization.
+// SerializeResource turns a resource into a structure suitable for serialization. The returned bool
+// reports whether serialization encoded strings containing non-UTF8 bytes: encoding inside secrets is
+// invisible once they are encrypted, so this must be reported here, while the plaintext is still visible.
 func SerializeResource(
-	ctx context.Context, res *resource.State, enc config.Encrypter, showSecrets bool,
-) (apitype.ResourceV3, error) {
+	ctx context.Context, res *pkgresource.State, enc config.Encrypter, showSecrets bool,
+) (apitype.ResourceV3, bool, error) {
 	contract.Requiref(res != nil, "res", "must not be nil")
 	contract.Requiref(res.URN != "", "res", "must have a URN")
 
 	res.Lock.Lock()
 	defer res.Lock.Unlock()
 
+	encodedByteString := propertyMapNeedsByteString(res.Inputs) ||
+		propertyMapNeedsByteString(res.Outputs) ||
+		propertyValueNeedsByteString(resource.ToResourcePropertyValue(res.ReplacementTrigger))
+
 	// Serialize all input and output properties recursively, and add them if non-empty.
 	var inputs map[string]any
 	if inp := res.Inputs; inp != nil {
 		sinp, err := SerializeProperties(ctx, inp, enc, showSecrets)
 		if err != nil {
-			return apitype.ResourceV3{}, err
+			return apitype.ResourceV3{}, false, err
 		}
 		inputs = sinp
 	}
@@ -511,17 +680,19 @@ func SerializeResource(
 	if outp := res.Outputs; outp != nil {
 		soutp, err := SerializeProperties(ctx, outp, enc, showSecrets)
 		if err != nil {
-			return apitype.ResourceV3{}, err
+			return apitype.ResourceV3{}, false, err
 		}
 		outputs = soutp
 	}
 
-	trigger, err := SerializePropertyValue(ctx, res.ReplacementTrigger, enc, showSecrets)
+	trigger, err := SerializePropertyValue(
+		ctx, resource.ToResourcePropertyValue(res.ReplacementTrigger), enc, showSecrets,
+	)
 	if err != nil {
-		return apitype.ResourceV3{}, err
+		return apitype.ResourceV3{}, false, err
 	}
 
-	stackTrace := slices.Collect(fxs.Map(res.StackTrace, func(frame resource.StackFrame) apitype.StackFrameV1 {
+	stackTrace := slices.Collect(fxs.Map(res.StackTrace, func(frame pkgresource.StackFrame) apitype.StackFrameV1 {
 		return apitype.StackFrameV1{SourcePosition: frame.SourcePosition}
 	}))
 
@@ -540,6 +711,7 @@ func SerializeResource(
 		Dependencies:            res.Dependencies,
 		InitErrors:              res.InitErrors,
 		Provider:                res.Provider,
+		ExtensionRef:            res.ExtensionRef,
 		PropertyDependencies:    res.PropertyDependencies,
 		PendingReplacement:      res.PendingReplacement,
 		AdditionalSecretOutputs: res.AdditionalSecretOutputs,
@@ -559,27 +731,28 @@ func SerializeResource(
 		RefreshBeforeUpdate:     res.RefreshBeforeUpdate,
 		ViewOf:                  res.ViewOf,
 		ResourceHooks:           res.ResourceHooks,
+		SnippetID:               res.SnippetID,
 	}
 
 	if res.CustomTimeouts.IsNotEmpty() {
 		v3Resource.CustomTimeouts = &res.CustomTimeouts
 	}
 
-	return v3Resource, nil
+	return v3Resource, encodedByteString, nil
 }
 
 // SerializeOperation serializes a resource in a pending state.
 func SerializeOperation(
-	ctx context.Context, op resource.Operation, enc config.Encrypter, showSecrets bool,
-) (apitype.OperationV2, error) {
-	res, err := SerializeResource(ctx, op.Resource, enc, showSecrets)
+	ctx context.Context, op pkgresource.Operation, enc config.Encrypter, showSecrets bool,
+) (apitype.OperationV2, bool, error) {
+	res, encodedByteString, err := SerializeResource(ctx, op.Resource, enc, showSecrets)
 	if err != nil {
-		return apitype.OperationV2{}, fmt.Errorf("serializing resource: %w", err)
+		return apitype.OperationV2{}, false, fmt.Errorf("serializing resource: %w", err)
 	}
 	return apitype.OperationV2{
 		Resource: res,
 		Type:     apitype.OperationType(op.Type),
-	}, nil
+	}, encodedByteString, nil
 }
 
 // SerializeProperties serializes a resource property bag so that it's suitable for serialization.
@@ -707,6 +880,15 @@ func SerializePropertyValue(ctx context.Context, prop resource.PropertyValue, en
 		return &secret, nil
 	}
 
+	// Strings containing bytes that are not valid UTF-8 would be corrupted by JSON encoding, so they are
+	// serialized with a signature carrying the base64 encoding of their bytes.
+	if prop.IsString() && !utf8.ValidString(prop.StringValue()) {
+		return map[string]any{
+			resource.SigKey: resource.ByteStringSig,
+			"value":         base64.StdEncoding.EncodeToString([]byte(prop.StringValue())),
+		}, nil
+	}
+
 	// Floats need special handling for Inf and NaN.
 	if prop.IsNumber() && (math.IsNaN(prop.NumberValue()) || math.IsInf(prop.NumberValue(), 0)) {
 		// We just save this as hexadecimal strings to preserve precision.
@@ -723,7 +905,7 @@ func SerializePropertyValue(ctx context.Context, prop resource.PropertyValue, en
 }
 
 // DeserializeResource turns a serialized resource back into its usual form.
-func DeserializeResource(res apitype.ResourceV3, dec config.Decrypter) (*resource.State, error) {
+func DeserializeResource(res apitype.ResourceV3, dec config.Decrypter) (*pkgresource.State, error) {
 	// Deserialize the resource properties, if they exist.
 	inputs, err := DeserializeProperties(res.Inputs, dec)
 	if err != nil {
@@ -751,11 +933,11 @@ func DeserializeResource(res apitype.ResourceV3, dec config.Decrypter) (*resourc
 		return nil, fmt.Errorf("resource '%s' has 'custom' false but non-empty ID", res.URN)
 	}
 
-	stackTrace := slices.Collect(fxs.Map(res.StackTrace, func(frame apitype.StackFrameV1) resource.StackFrame {
-		return resource.StackFrame{SourcePosition: frame.SourcePosition}
+	stackTrace := slices.Collect(fxs.Map(res.StackTrace, func(frame apitype.StackFrameV1) pkgresource.StackFrame {
+		return pkgresource.StackFrame{SourcePosition: frame.SourcePosition}
 	}))
 
-	return resource.NewState{
+	return pkgresource.NewState{
 			Type:                    res.Type,
 			URN:                     res.URN,
 			Custom:                  res.Custom,
@@ -770,6 +952,7 @@ func DeserializeResource(res apitype.ResourceV3, dec config.Decrypter) (*resourc
 			Dependencies:            res.Dependencies,
 			InitErrors:              res.InitErrors,
 			Provider:                res.Provider,
+			ExtensionRef:            res.ExtensionRef,
 			PropertyDependencies:    res.PropertyDependencies,
 			PendingReplacement:      res.PendingReplacement,
 			AdditionalSecretOutputs: res.AdditionalSecretOutputs,
@@ -786,22 +969,23 @@ func DeserializeResource(res apitype.ResourceV3, dec config.Decrypter) (*resourc
 			IgnoreChanges:           res.IgnoreChanges,
 			HideDiff:                res.HideDiff,
 			ReplaceOnChanges:        res.ReplaceOnChanges,
-			ReplacementTrigger:      trigger,
+			ReplacementTrigger:      resource.FromResourcePropertyValue(trigger),
 			RefreshBeforeUpdate:     res.RefreshBeforeUpdate,
 			ViewOf:                  res.ViewOf,
 			ResourceHooks:           res.ResourceHooks,
+			SnippetID:               res.SnippetID,
 		}.Make(),
 		nil
 }
 
 // DeserializeOperation hydrates a pending resource/operation pair.
 func DeserializeOperation(op apitype.OperationV2, dec config.Decrypter,
-) (resource.Operation, error) {
+) (pkgresource.Operation, error) {
 	res, err := DeserializeResource(op.Resource, dec)
 	if err != nil {
-		return resource.Operation{}, err
+		return pkgresource.Operation{}, err
 	}
-	return resource.NewOperation(res, resource.OperationType(op.Type)), nil
+	return pkgresource.NewOperation(res, pkgresource.OperationType(op.Type)), nil
 }
 
 // DeserializeProperties deserializes an entire map of deploy properties into a resource property map.
@@ -828,7 +1012,8 @@ func deserializeSecret(
 	if (secret.Plaintext == "" && secret.Ciphertext == "") ||
 		(secret.Plaintext != "" && secret.Ciphertext != "") {
 		return resource.PropertyValue{}, errors.New(
-			"malformed secret value: exactly one of `ciphertext` or `plaintext` must be supplied")
+			"malformed secret value: exactly one of `ciphertext` or `plaintext` must be supplied",
+		)
 	}
 
 	if secret.Plaintext != "" {
@@ -914,7 +1099,8 @@ func DeserializePropertyValue(v any, dec config.Decrypter,
 					plaintext, plainOk := objmap["plaintext"].(string)
 					if (!cipherOk && !plainOk) || (plainOk && cipherOk) {
 						return resource.PropertyValue{}, errors.New(
-							"malformed secret value: exactly one of `ciphertext` or `plaintext` must be supplied")
+							"malformed secret value: exactly one of `ciphertext` or `plaintext` must be supplied",
+						)
 					}
 					secret := &apitype.SecretV1{
 						Sig:        resource.SecretSig,
@@ -975,6 +1161,18 @@ func DeserializePropertyValue(v any, dec config.Decrypter,
 						return resource.MakeCustomResourceReference(urn, resource.ID(id), packageVersion), nil
 					}
 					return resource.MakeComponentResourceReference(urn, packageVersion), nil
+				case resource.ByteStringSig:
+					encoded, ok := objmap["value"].(string)
+					if !ok {
+						return resource.PropertyValue{},
+							errors.New("malformed byte string: missing or non-string 'value' field")
+					}
+					decoded, err := base64.StdEncoding.DecodeString(encoded)
+					if err != nil {
+						return resource.PropertyValue{},
+							fmt.Errorf("malformed byte string: unable to parse 'value' field: %w", err)
+					}
+					return resource.NewProperty(string(decoded)), nil
 				case floatSignature:
 					hex, ok := objmap["value"].(string)
 					if !ok {
@@ -1023,7 +1221,8 @@ func FormatDeploymentDeserializationError(err error, stackName string) error {
 		return fmt.Errorf(
 			"the stack '%s' uses features that are not supported by this version of the Pulumi CLI: %s. "+
 				"Please update your version of the Pulumi CLI",
-			stackName, strings.Join(unsupportedErr.Features, ", "))
+			stackName, strings.Join(unsupportedErr.Features, ", "),
+		)
 	case errors.Is(err, ErrDeploymentSchemaVersionTooOld):
 		return fmt.Errorf("the stack '%s' is too old to be used by this version of the Pulumi CLI",
 			stackName)

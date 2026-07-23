@@ -24,8 +24,8 @@ import (
 	"github.com/blang/semver"
 
 	"github.com/pulumi/pulumi/pkg/v3/codegen/schema"
+	"github.com/pulumi/pulumi/pkg/v3/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 )
 
@@ -63,10 +63,6 @@ func (p *OutputProvider) Configure(
 	return plugin.ConfigureResponse{}, nil
 }
 
-func (p *OutputProvider) Pkg() tokens.Package {
-	return "output"
-}
-
 func (p *OutputProvider) GetPluginInfo(context.Context) (plugin.PluginInfo, error) {
 	ver := semver.MustParse("23.0.0")
 	return plugin.PluginInfo{
@@ -80,7 +76,7 @@ func (p *OutputProvider) GetSchema(
 	pkg := schema.PackageSpec{
 		Name:    "output",
 		Version: "23.0.0",
-		Provider: schema.ResourceSpec{
+		Provider: &schema.ResourceSpec{
 			InputProperties: map[string]schema.PropertySpec{
 				"elideUnknowns": {
 					TypeSpec: schema.TypeSpec{
@@ -104,8 +100,14 @@ func (p *OutputProvider) GetSchema(
 								Type: "string",
 							},
 						},
+						"secretOutput": {
+							Secret: true,
+							TypeSpec: schema.TypeSpec{
+								Type: "string",
+							},
+						},
 					},
-					Required: []string{"value", "output"},
+					Required: []string{"value", "output", "secretOutput"},
 				},
 				InputProperties: map[string]schema.PropertySpec{
 					"value": {
@@ -378,6 +380,7 @@ func (p *OutputProvider) makeOutputs(
 		switch typ { //nolint:exhaustive
 		case "output:index:Resource":
 			properties["output"] = resource.NewProperty(output)
+			properties["secretOutput"] = resource.NewProperty(output)
 		case "output:index:ComplexResource":
 			properties["outputArray"] = resource.NewProperty([]resource.PropertyValue{
 				resource.NewProperty(output),
@@ -398,6 +401,7 @@ func (p *OutputProvider) makeOutputs(
 		switch typ { //nolint:exhaustive
 		case "output:index:Resource":
 			properties["output"] = resource.NewProperty(resource.Computed{Element: resource.NewProperty("")})
+			properties["secretOutput"] = resource.NewProperty(resource.Computed{Element: resource.NewProperty("")})
 		case "output:index:ComplexResource":
 			properties["outputArray"] = resource.NewProperty(resource.Computed{Element: resource.NewProperty("")})
 			properties["outputMap"] = resource.NewProperty(resource.Computed{Element: resource.NewProperty("")})

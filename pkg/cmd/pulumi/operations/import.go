@@ -24,6 +24,8 @@ import (
 	"os"
 	"strings"
 
+	pkgresource "github.com/pulumi/pulumi/pkg/v3/resource"
+
 	"github.com/blang/semver"
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/hcl/v2"
@@ -37,19 +39,23 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/backend/display"
 	"github.com/pulumi/pulumi/pkg/v3/backend/secrets"
 	cmdBackend "github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/backend"
+	cmdCmd "github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/cmd"
 	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/config"
 	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/constrictor"
 	cmdConvert "github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/convert"
 	cmdDiag "github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/diag"
 	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/metadata"
+	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/packageworkspace"
 	cmdStack "github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/stack"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/convert"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/pcl"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/schema"
 	"github.com/pulumi/pulumi/pkg/v3/engine"
+	pkghost "github.com/pulumi/pulumi/pkg/v3/host"
 	"github.com/pulumi/pulumi/pkg/v3/importer"
 	"github.com/pulumi/pulumi/pkg/v3/pluginstorage"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
+	"github.com/pulumi/pulumi/pkg/v3/resource/plugin"
 	resourcestack "github.com/pulumi/pulumi/pkg/v3/resource/stack"
 	pkgWorkspace "github.com/pulumi/pulumi/pkg/v3/workspace"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
@@ -58,21 +64,21 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/common/providers"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	sdkconfig "github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/cmdutil"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/util/rpcutil/rpcerror"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/version"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 )
 
 func parseResourceSpec(spec string) (string, resource.URN, error) {
-	equals := strings.Index(spec, "=")
-	if equals == -1 {
+	before, after, ok := strings.Cut(spec, "=")
+	if !ok {
 		return "", "", errors.New("spec must be of the form name=URN")
 	}
 
-	name, urn := spec[:equals], resource.URN(spec[equals+1:])
+	name, urn := before, resource.URN(after)
 	if name == "" || urn == "" {
 		return "", "", errors.New("spec must be of the form name=URN")
 	}
@@ -100,6 +106,23 @@ func makeImportFileFromResourceList(resources []plugin.ResourceImport) (importFi
 			Component:         res.IsComponent,
 			Remote:            res.IsRemote,
 			LogicalName:       res.LogicalName,
+			Parent:            res.Parent,
+			Properties:        res.Properties,
+			Provider:          res.Provider,
+		}
+		if p := res.Parameterization; p != nil {
+			specs[i].Parameterization = &importParameterization{
+				PluginName:    p.PluginName,
+				PluginVersion: p.PluginVersion,
+				Value:         p.Value,
+			}
+		}
+		if e := res.Extension; e != nil {
+			specs[i].Extension = &importExtension{
+				Name:    e.Name,
+				Version: e.Version,
+				Value:   e.Value,
+			}
 		}
 	}
 
@@ -167,8 +190,41 @@ type importSpec struct {
 	Component         bool        `json:"component,omitempty"`
 	Remote            bool        `json:"remote,omitempty"`
 
+	// Inputs holds input properties supplied for the resource. Values the provider's Read cannot return
+	// (e.g. write-only attributes) are taken from here instead. For a provider declared in the resources
+	// block, Inputs is its configuration.
+	Inputs map[string]any `json:"inputs,omitempty"`
+	// Outputs holds the resource's full output state. When set, the resource is imported from these
+	// values directly and the provider's Read is skipped entirely.
+	Outputs map[string]any `json:"outputs,omitempty"`
+
 	// LogicalName is the resources Pulumi name (i.e. the first argument to `new Resource`).
 	LogicalName string `json:"logicalName,omitempty"`
+
+	// Parameterization is set when the resource should be imported under a replacement-parameterized
+	// (e.g. dynamically bridged) provider rather than a plain one.
+	Parameterization *importParameterization `json:"parameterization,omitempty"`
+
+	// Extension is set when an extension parameterization should be applied to the resource's (base)
+	// provider. Mutually exclusive with Parameterization.
+	Extension *importExtension `json:"extension,omitempty"`
+}
+
+// importParameterization is the JSON representation of a resource's replacement parameterization. The
+// parameterized package name and version are taken from the resource's own type and version; these
+// fields describe the base plugin the parameterization is applied to.
+type importParameterization struct {
+	PluginName    string `json:"pluginName"`
+	PluginVersion string `json:"pluginVersion"`
+	Value         []byte `json:"value"`
+}
+
+// importExtension is the JSON representation of an extension parameterization applied to a resource's
+// (base) provider.
+type importExtension struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+	Value   []byte `json:"value"`
 }
 
 type importFile struct {
@@ -177,6 +233,8 @@ type importFile struct {
 	// ProviderInputs maps provider names (as used in NameTable and importSpec.Provider) to
 	// their serialized inputs. This allows the import system to create explicit providers
 	// that are not yet in state with the correct configuration. Secrets are encrypted.
+	//
+	// Deprecated: declare the provider in Resources and set its configuration via its Inputs instead.
 	ProviderInputs map[string]map[string]any `json:"providerInputs,omitempty"`
 }
 
@@ -306,7 +364,23 @@ func parseImportFile(
 		if spec.Name == "" {
 			pusherrf("%v has no name", describeResource(i, spec))
 		}
-		if !spec.Component && spec.ID == "" {
+		if providers.IsProviderType(spec.Type) {
+			// Providers declared in the resources block are created during import rather than read
+			// from a cloud, so they take no ID.
+			if spec.ID != "" {
+				pusherrf("%v has an ID, but is a provider, which is created rather than read",
+					describeResource(i, spec))
+			}
+			if spec.Component {
+				pusherrf("%v is a provider and may not be marked as a component", describeResource(i, spec))
+			}
+			if spec.Parent != "" {
+				pusherrf("%v is a provider and may not have a parent", describeResource(i, spec))
+			}
+			if len(spec.Outputs) > 0 {
+				pusherrf("%v is a provider and may not have outputs", describeResource(i, spec))
+			}
+		} else if !spec.Component && spec.ID == "" {
 			pusherrf("%v has no ID", describeResource(i, spec))
 		} else if spec.Component && spec.ID != "" {
 			pusherrf("%v has an ID, but is marked as a component", describeResource(i, spec))
@@ -473,10 +547,13 @@ func parseImportFile(
 				pusherrf("%v has an ambiguous provider",
 					describeResource(i, spec))
 			}
-			urn, ok := f.NameTable[spec.Provider]
+			// urnMapping covers both the name table and the URNs built above for in-file resources.
+			urn, ok := urnMapping[spec.Provider]
 			if !ok {
-				pusherrf("the provider '%v' for %v has no entry in 'nameTable'",
+				pusherrf("the provider '%v' for %v has no entry in 'nameTable' or 'resources'",
 					spec.Provider, describeResource(i, spec))
+			} else if !urn.IsValid() || !providers.IsProviderType(urn.Type()) {
+				pusherrf("the provider '%v' for %v is not a provider", spec.Provider, describeResource(i, spec))
 			} else {
 				imp.Provider = urn
 			}
@@ -494,6 +571,39 @@ func parseImportFile(
 			}
 		}
 
+		if providers.IsProviderType(spec.Type) {
+			serializedInputs, ok := f.ProviderInputs[spec.Name]
+			if spec.Inputs != nil {
+				serializedInputs, ok = spec.Inputs, true
+			}
+			if ok {
+				providerInputs, err := resourcestack.DeserializeProperties(serializedInputs, dec)
+				if err != nil {
+					pusherrf("could not deserialize provider inputs for %v: %w",
+						describeResource(i, spec), err)
+				} else {
+					imp.ProviderInputs = providerInputs
+				}
+			}
+		} else {
+			if spec.Inputs != nil {
+				inputs, err := resourcestack.DeserializeProperties(spec.Inputs, dec)
+				if err != nil {
+					pusherrf("could not deserialize inputs for %v: %w", describeResource(i, spec), err)
+				} else {
+					imp.Inputs = inputs
+				}
+			}
+			if spec.Outputs != nil {
+				outputs, err := resourcestack.DeserializeProperties(spec.Outputs, dec)
+				if err != nil {
+					pusherrf("could not deserialize outputs for %v: %w", describeResource(i, spec), err)
+				} else {
+					imp.Outputs = outputs
+				}
+			}
+		}
+
 		if spec.Version != "" {
 			v, err := semver.ParseTolerant(spec.Version)
 			if err != nil {
@@ -501,6 +611,32 @@ func parseImportFile(
 					spec.Version, describeResource(i, spec), err)
 			} else {
 				imp.Version = &v
+			}
+		}
+
+		if spec.Parameterization != nil {
+			v, err := semver.ParseTolerant(spec.Parameterization.PluginVersion)
+			if err != nil {
+				pusherrf("could not parse parameterization version '%v' for %v: %w",
+					spec.Parameterization.PluginVersion, describeResource(i, spec), err)
+			} else {
+				imp.Parameterization = &deploy.Parameterization{
+					PluginName:    tokens.Package(spec.Parameterization.PluginName),
+					PluginVersion: v,
+					Value:         spec.Parameterization.Value,
+				}
+			}
+		}
+
+		if spec.Extension != nil {
+			if spec.Parameterization != nil {
+				pusherrf("%v has both a parameterization and an extension, which are mutually exclusive",
+					describeResource(i, spec))
+			}
+			imp.Extension = &apitype.Extension{
+				Name:    spec.Extension.Name,
+				Version: spec.Extension.Version,
+				Value:   spec.Extension.Value,
 			}
 		}
 
@@ -549,14 +685,14 @@ func generateImportedDefinitions(ctx *plugin.Context,
 		}
 	}()
 
-	resourceTable := map[resource.URN]*resource.State{}
+	resourceTable := map[resource.URN]*pkgresource.State{}
 	for _, r := range snap.Resources {
 		if !r.Delete {
 			resourceTable[r.URN] = r
 		}
 	}
 
-	var resources []*resource.State
+	var resources []*pkgresource.State
 	for _, i := range imports {
 		var parentType tokens.Type
 		if i.Parent != "" {
@@ -575,7 +711,7 @@ func generateImportedDefinitions(ctx *plugin.Context,
 		return false, nil
 	}
 
-	loader := schema.NewPluginLoader(ctx.Host)
+	loader := schema.NewPluginLoader(ctx)
 	err := importer.GenerateLanguageDefinitions(
 		out,
 		loader,
@@ -613,6 +749,7 @@ func NewImportCmd() *cobra.Command {
 	var debug bool
 	var message string
 	var stackName string
+	var configFile string
 	var execKind string
 	var execAgent string
 
@@ -662,7 +799,7 @@ func NewImportCmd() *cobra.Command {
 			"The type token and property used for resource lookup are available in the Import section of\n" +
 			"the resource's API documentation in the Pulumi Registry (https://www.pulumi.com/registry/)." +
 			"\n" +
-			"To fully specify parent and/or provider, subsitute the <urn> for each into the following:\n" +
+			"To fully specify parent and/or provider, substitute the <urn> for each into the following:\n" +
 			"\n" +
 			"     pulumi import 'aws:iam/user:User' name id --parent 'parent=<urn>' --provider 'admin=<urn>'\n" +
 			"\n" +
@@ -712,7 +849,7 @@ func NewImportCmd() *cobra.Command {
 
 			ws := pkgWorkspace.Instance
 
-			proj, root, err := ws.ReadProject()
+			proj, root, err := ws.ReadProject("")
 			if err != nil {
 				return err
 			}
@@ -728,10 +865,20 @@ func NewImportCmd() *cobra.Command {
 				return fmt.Errorf("get working directory: %w", err)
 			}
 			sink := cmdutil.Diag()
-			pCtx, err := plugin.NewContext(ctx, sink, sink, nil, nil, cwd, nil, true, nil, schema.NewLoaderServerFromHost)
+			reg := cmdCmd.NewDefaultRegistry(ctx, cmdBackend.DefaultLoginManager, ws, proj, sink, env.Global())
+			pluginHost, err := pkghost.New(context.WithoutCancel(ctx), sink, sink, nil,
+				pkgWorkspace.EnsureLanguageInstalled, schema.NewLoaderServerFromContext, convert.NewMapperServerFromContext,
+				packageworkspace.NewResolverServer(reg))
+			if err != nil {
+				return fmt.Errorf("create plugin host: %w", err)
+			}
+			// host is owned here, closed after the context
+			defer contract.IgnoreClose(pluginHost)
+			pCtx, err := plugin.NewContext(ctx, sink, sink, pluginHost, nil, cwd, nil, true, nil)
 			if err != nil {
 				return fmt.Errorf("create plugin context: %w", err)
 			}
+			defer contract.IgnoreClose(pCtx)
 
 			var importFile importFile
 			if importFilePath != "" {
@@ -773,7 +920,7 @@ func NewImportCmd() *cobra.Command {
 						pCtx.Diag.Warningf(diag.Message("", "failed to create plugin spec for provider %q: %v"), pluginName, err)
 						return nil
 					}
-					version, err := pkgWorkspace.InstallPlugin(ctx, pluginSpec, log, schema.NewLoaderServerFromHost)
+					version, err := pkgWorkspace.InstallPlugin(ctx, pluginSpec, log, schema.NewLoaderServerFromContext)
 					if err != nil {
 						pCtx.Diag.Warningf(diag.Message("", "failed to install provider %q: %v"), pluginName, err)
 						return nil
@@ -784,7 +931,7 @@ func NewImportCmd() *cobra.Command {
 				baseMapper, err := convert.NewBasePluginMapper(
 					pluginstorage.Instance,
 					from, /*conversionKey*/
-					convert.ProviderFactoryFromHost(ctx, pCtx.Host),
+					convert.ProviderFactoryFromHost(ctx, pCtx),
 					installPlugin,
 					nil, /*mappings*/
 				)
@@ -794,7 +941,10 @@ func NewImportCmd() *cobra.Command {
 				}
 
 				mapperServer := convert.NewMapperServer(mapper)
-				grpcServer, err := plugin.NewServer(pCtx, convert.MapperRegistration(mapperServer))
+				loaderServer := schema.NewLoaderServer(schema.NewPluginLoader(pCtx))
+				grpcServer, err := plugin.NewServer(pCtx,
+					convert.MapperRegistration(mapperServer),
+					schema.LoaderRegistration(loaderServer))
 				if err != nil {
 					return err
 				}
@@ -802,9 +952,15 @@ func NewImportCmd() *cobra.Command {
 				resp, err := converter.ConvertState(ctx, &plugin.ConvertStateRequest{
 					MapperTarget: grpcServer.Addr(),
 					Args:         args,
+					LoaderTarget: grpcServer.Addr(),
 				})
 				if err != nil {
-					return err
+					rpcErr := rpcerror.Convert(err)
+					msg := strings.TrimSpace(rpcErr.Message())
+					if msg == "" {
+						return fmt.Errorf("converter %q failed: %w", from, err)
+					}
+					return fmt.Errorf("converter %q failed: %s", from, msg)
 				}
 
 				cmdDiag.PrintDiagnostics(sink, resp.Diagnostics)
@@ -917,18 +1073,24 @@ func NewImportCmd() *cobra.Command {
 				stackName,
 				cmdStack.LoadOnly,
 				opts.Display,
+				configFile,
 			)
 			if err != nil {
 				return err
 			}
 
-			cfg, sm, err := config.GetStackConfiguration(ctx, sink, ssml, s, proj)
+			cfg, sm, err := config.GetStackConfiguration(ctx, sink, ssml, s, proj, configFile, nil)
 			if err != nil {
 				return fmt.Errorf("getting stack configuration: %w", err)
 			}
 
 			decrypter := sm.Decrypter()
 			encrypter := sm.Encrypter()
+
+			if len(importFile.ProviderInputs) > 0 {
+				sink.Warningf(diag.Message("", "the 'providerInputs' field is deprecated: declare the "+
+					"provider in 'resources' and set its configuration via its 'inputs' instead"))
+			}
 
 			imports, nameTable, err := parseImportFile(
 				importFile, s.Ref().Name(), proj.Name, protectResources, decrypter)
@@ -945,12 +1107,21 @@ func NewImportCmd() *cobra.Command {
 				}
 				sink := cmdutil.Diag()
 
-				ctx, err := plugin.NewContext(ctx, sink, sink, nil, nil, cwd, nil, true, nil, schema.NewLoaderServerFromHost)
+				innerReg := cmdCmd.NewDefaultRegistry(ctx, cmdBackend.DefaultLoginManager, ws, proj, sink, env.Global())
+				innerHost, err := pkghost.New(context.WithoutCancel(ctx), sink, sink, nil,
+					pkgWorkspace.EnsureLanguageInstalled, schema.NewLoaderServerFromContext, convert.NewMapperServerFromContext,
+					packageworkspace.NewResolverServer(innerReg))
 				if err != nil {
 					return nil, nil, err
 				}
-				defer contract.IgnoreClose(pCtx.Host)
-				languagePlugin, err := ctx.Host.LanguageRuntime(proj.Runtime.Name())
+				// host is owned here, closed after the context
+				defer contract.IgnoreClose(innerHost)
+				ctx, err := plugin.NewContext(ctx, sink, sink, innerHost, nil, cwd, nil, true, nil)
+				if err != nil {
+					return nil, nil, err
+				}
+				defer contract.IgnoreClose(ctx)
+				languagePlugin, err := ctx.Host.LanguageRuntime(ctx, proj.Runtime.Name())
 				if err != nil {
 					return nil, nil, err
 				}
@@ -982,7 +1153,7 @@ func NewImportCmd() *cobra.Command {
 			cmdutil.SetStringSpanAttributes(ctx, m.Environment)
 
 			stackName := s.Ref().Name().String()
-			configErr := workspace.ValidateStackConfigAndApplyProjectConfig(
+			configErr := pkgWorkspace.ValidateStackConfigAndApplyProjectConfig(
 				ctx,
 				stackName,
 				proj,
@@ -1014,7 +1185,7 @@ func NewImportCmd() *cobra.Command {
 				Scopes:             backend.CancellationScopes,
 			}, imports)
 
-			if generateCode {
+			if generateCode && proj.Runtime.Name() != "" {
 				deployment, err := getCurrentDeploymentForStack(ctx, s)
 				if err != nil {
 					return err
@@ -1110,7 +1281,7 @@ func NewImportCmd() *cobra.Command {
 		&stackName, "stack", "s", "",
 		"The name of the stack to operate on. Defaults to the current stack")
 	cmd.PersistentFlags().StringVar(
-		&cmdStack.ConfigFile, "config-file", "",
+		&configFile, "config-file", "",
 		"Use the configuration values in the specified file rather than detecting the file name")
 
 	// Flags for engine.UpdateOptions.

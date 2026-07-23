@@ -17,11 +17,13 @@ package deploy
 import (
 	"time"
 
+	pkgresource "github.com/pulumi/pulumi/pkg/v3/resource"
+
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	pulumirpc "github.com/pulumi/pulumi/sdk/v3/proto/go"
 )
 
-func resourceOptionsFromState(state *resource.State) *pulumirpc.ResourceOptions {
+func resourceOptionsFromState(state *pkgresource.State) *pulumirpc.ResourceOptions {
 	if state == nil {
 		return nil
 	}
@@ -53,6 +55,7 @@ func resourceOptionsFromState(state *resource.State) *pulumirpc.ResourceOptions 
 			Create: secondsToDurationString(state.CustomTimeouts.Create),
 			Update: secondsToDurationString(state.CustomTimeouts.Update),
 			Delete: secondsToDurationString(state.CustomTimeouts.Delete),
+			Read:   secondsToDurationString(state.CustomTimeouts.Read),
 		}
 	}
 
